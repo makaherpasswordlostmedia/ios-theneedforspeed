@@ -1,0 +1,703 @@
+name: NFS 3DO -> iOS 7 armv7 (single-file build)
+
+# ONE file. Put it at .github/workflows/nfs-ios7.yml in YOUR FORK of pc-theneedforspeed (default branch), then Actions -> this workflow -> Run workflow. Nothing else to upload:
+# the host code, Makefile and plist are written by the "Write project" step below.
+# Your own disc: upload the ISO (2048-byte blocks, 327,980 blocks) to Google Drive,
+# sharing "Anyone with the link", and paste its file ID (or save secret DRIVE_ISO_ID).
+# No game data is ever committed or published; only the .ipa/.deb and diagnostics are uploaded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_file_id:
+        description: "Drive file ID of your NFS 3DO .iso (empty = secret DRIVE_ISO_ID)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: NFS 3DO armv7 (Theos, iOS 7.0-9.3.5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WORK: ${{ github.workspace }}/work
+      NFS: ${{ github.workspace }}
+      P: ${{ github.workspace }}/work/proj
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl curl ca-certificates zip unzip xz-utils bzip2 git fakeroot make python3 python3-pip python3-venv
+          mkdir -p "$WORK" "$P"
+          python3 -m venv "$WORK/venv"
+          "$WORK/venv/bin/pip" install -q gdown capstone
+
+      - name: Fetch your disc image from Google Drive
+        env:
+          ISO_ID: ${{ inputs.iso_file_id || secrets.DRIVE_ISO_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "${ISO_ID:-}" ] || { echo "::error::No ISO ID. Fill iso_file_id or set secret DRIVE_ISO_ID."; exit 1; }
+          mkdir -p "$NFS/iso"
+          "$WORK/venv/bin/gdown" "$ISO_ID" -O "$NFS/iso/nfs.iso"
+          printf 'FILE "nfs.iso" BINARY\n  TRACK 01 MODE1/2048\n    INDEX 01 00:00:00\n' > "$NFS/iso/nfs.cue"
+          ls -la "$NFS/iso"
+
+      - name: Extract disc and recompile (3dokit, from the repo README)
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -euo pipefail
+          PY="$WORK/venv/bin/python"
+          D=iso/nfs.cue
+          "$PY" -m 3dokit.disc "$D" --verify || true
+          "$PY" -m 3dokit.disc "$D" --extract build/disc
+          "$PY" -m 3dokit.recomp --out build/recomp --optest \
+            "launchme=build/disc/LaunchMe" "frontovl=build/disc/frontovl" \
+            "lmadm=build/disc/System/Programs/LMADM" "format=build/disc/System/Programs/FORMAT" 2>&1 | tee "$WORK/recomp.log"
+          ls build/recomp | head -50
+
+      - name: Write project (host, Makefile, plist - all embedded in this file)
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$P/host/nfs_host.h")"
+          cat > "$P/host/nfs_host.h" <<'NFS_EOF'
+          /* nfs_host.h - the seam between the pfboot core (3dokit-recompiled NFS + Portfolio runtime)
+           * and the iOS 7 / armv7 host. The core's SDL3 window/audio/pad layer is replaced by this.
+           * Plain C so it links from both the C++ core and the Objective-C host. */
+          #ifndef NFS_HOST_H
+          #define NFS_HOST_H
+          #include <stdint.h>
+          #include <stdbool.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* 3DO control pad bits (nfs_pad_state). In NFS: A = throttle, R = gear up. */
+          enum {
+              NFS_PAD_UP = 1u << 0,   NFS_PAD_DOWN = 1u << 1,
+              NFS_PAD_LEFT = 1u << 2, NFS_PAD_RIGHT = 1u << 3,
+              NFS_PAD_A = 1u << 4,    NFS_PAD_B = 1u << 5,   NFS_PAD_C = 1u << 6,
+              NFS_PAD_L = 1u << 7,    NFS_PAD_R = 1u << 8,
+              NFS_PAD_X = 1u << 9,    /* Stop */
+              NFS_PAD_P = 1u << 10    /* Play / Start */
+          };
+
+          /* ---- the core implements these (pfboot's main loop, wrapped in core/nfs_core_glue.cpp) ---- */
+          /* Boot the extracted disc tree (disc_dir holds LaunchMe, frontovl, ...) as the console does.
+           * Blocks until the game quits. nvram_dir is formatted by the disc's own FORMAT when blank. */
+          int  nfs_core_run(const char *disc_dir, const char *nvram_dir);
+          /* Mix `frames` stereo frames, interleaved s16, 44100 Hz. Called from the audio thread. */
+          void nfs_core_audio_mix(int16_t *out, int frames);
+
+          /* ---- the host owns these; the core reads them ---- */
+          extern volatile uint32_t nfs_pad_state;
+          extern volatile int      nfs_paused;      /* 1 while the app is inactive: the core must idle */
+
+          /* ---- the host implements these; the core calls them ---- */
+          /* One finished frame (320x240), pixels little-endian 0xXXRRGGBB. */
+          void     nfs_host_present(const uint32_t *xrgb, int w, int h);
+          uint64_t nfs_host_time_ns(void);
+          void     nfs_host_sleep_us(unsigned us);
+          void     nfs_host_log(const char *fmt, ...);
+          void     nfs_host_fatal(const char *msg);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          NFS_EOF
+          mkdir -p "$(dirname "$P/host/ios_host.m")"
+          cat > "$P/host/ios_host.m" <<'NFS_EOF'
+          /* ios_host.m - UIKit / EAGL (GLES2) / AudioQueue host for the NFS (3DO) core.
+           * iOS 7.0-9.3.5, armv7, ARC on. Structure from CrashBandicoot.Native/host/ios_host.m:
+           * the emulation thread owns GL, touch overlay, MFi pad, pause on resign-active. */
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/ES2/gl.h>
+          #import <OpenGLES/ES2/glext.h>
+          #import <AudioToolbox/AudioToolbox.h>
+          #import <AVFoundation/AVFoundation.h>
+          #import <GameController/GameController.h>
+          #include <stdarg.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <sys/stat.h>
+          #include <mach/mach_time.h>
+          #include "nfs_host.h"
+
+          volatile uint32_t nfs_pad_state;
+          volatile int nfs_paused;
+
+          /* ---------------------------------------------------------------- paths / log */
+          static char g_docs[512], g_disc[600], g_nvram[600], g_logpath[600];
+          static FILE *g_logf;
+          static pthread_mutex_t g_log_mx = PTHREAD_MUTEX_INITIALIZER;
+
+          void nfs_host_log(const char *fmt, ...)
+          {
+              pthread_mutex_lock(&g_log_mx);
+              if (!g_logf && g_logpath[0]) g_logf = fopen(g_logpath, "a");
+              va_list a; va_start(a, fmt);
+              if (g_logf) { vfprintf(g_logf, fmt, a); fputc('\n', g_logf); fflush(g_logf); }
+              va_end(a);
+              pthread_mutex_unlock(&g_log_mx);
+          }
+
+          uint64_t nfs_host_time_ns(void)
+          {
+              static mach_timebase_info_data_t tb;
+              if (tb.denom == 0) mach_timebase_info(&tb);
+              uint64_t t = mach_absolute_time();
+              return (tb.numer == tb.denom) ? t : t * tb.numer / tb.denom;
+          }
+          void nfs_host_sleep_us(unsigned us) { usleep(us); }
+
+          /* ---------------------------------------------------------------- pad */
+          static volatile uint32_t g_touch_mask, g_gc_mask;
+          static void pad_recompute(void) { nfs_pad_state = g_touch_mask | g_gc_mask; }
+
+          /* ---------------------------------------------------------------- GL */
+          @interface GLView : UIView
+          @end
+          @implementation GLView
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+          @end
+
+          static GLView *g_glview;
+          static EAGLContext *g_ctx;
+          static GLuint g_fbo, g_rbo, g_prog, g_tex, g_vbo;
+          static GLint g_vw, g_vh;
+          static int g_tex_w, g_tex_h;
+
+          static const char *VS =
+              "attribute vec2 p; attribute vec2 t; varying mediump vec2 uv;"
+              "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
+          /* the core hands 0xXXRRGGBB little-endian = bytes B,G,R,X: swizzle on the GPU, no CPU pass */
+          static const char *FS =
+              "varying mediump vec2 uv; uniform sampler2D s;"
+              "void main(){ gl_FragColor = vec4(texture2D(s, uv).bgr, 1.0); }";
+
+          static GLuint compile(GLenum type, const char *src)
+          {
+              GLuint s = glCreateShader(type);
+              glShaderSource(s, 1, &src, NULL); glCompileShader(s);
+              GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) { char b[512]; glGetShaderInfoLog(s, sizeof b, NULL, b); nfs_host_log("[GL] shader: %s", b); }
+              return s;
+          }
+
+          static void gl_setup(void)
+          {
+              __block CAEAGLLayer *layer = nil;
+              dispatch_sync(dispatch_get_main_queue(), ^{
+                  layer = (CAEAGLLayer *)g_glview.layer;
+                  layer.opaque = YES;
+                  layer.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking: @NO,
+                                                kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGB565 };
+              });
+              g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+              [EAGLContext setCurrentContext:g_ctx];
+              glGenFramebuffers(1, &g_fbo); glGenRenderbuffers(1, &g_rbo);
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              [g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer];
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_rbo);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_vw);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_vh);
+
+              g_prog = glCreateProgram();
+              glAttachShader(g_prog, compile(GL_VERTEX_SHADER, VS));
+              glAttachShader(g_prog, compile(GL_FRAGMENT_SHADER, FS));
+              glBindAttribLocation(g_prog, 0, "p"); glBindAttribLocation(g_prog, 1, "t");
+              glLinkProgram(g_prog); glUseProgram(g_prog);
+              glUniform1i(glGetUniformLocation(g_prog, "s"), 0);
+
+              /* 4:3 letterbox quad; full screen on a 4:3 iPad */
+              float ar = (float)g_vw / (float)g_vh, sx = 1.f, sy = 1.f;
+              if (ar > 4.f / 3.f) sx = (4.f / 3.f) / ar; else sy = ar / (4.f / 3.f);
+              const float q[16] = { -sx,-sy, 0,1,   sx,-sy, 1,1,   -sx,sy, 0,0,   sx,sy, 1,0 };
+              glGenBuffers(1, &g_vbo); glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+              glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STATIC_DRAW);
+              glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
+              glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+
+              glGenTextures(1, &g_tex); glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
+              nfs_host_log("[GL] screen %dx%d", g_vw, g_vh);
+          }
+
+          void nfs_host_present(const uint32_t *px, int w, int h)
+          {
+              while (nfs_paused) usleep(10000);            /* no GL while backgrounded: iOS kills the app */
+              if (!g_ctx) gl_setup();
+              [EAGLContext setCurrentContext:g_ctx];
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              glViewport(0, 0, g_vw, g_vh);
+              glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+              glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_tex);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+              if (w != g_tex_w || h != g_tex_h) {
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                  g_tex_w = w; g_tex_h = h;
+              } else {
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+              }
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              [g_ctx presentRenderbuffer:GL_RENDERBUFFER];
+          }
+
+          /* ---------------------------------------------------------------- audio */
+          #define AUDIO_FRAMES 1024
+          static AudioQueueRef g_aq;
+          static void aq_cb(void *ud, AudioQueueRef q, AudioQueueBufferRef b)
+          {
+              nfs_core_audio_mix((int16_t *)b->mAudioData, AUDIO_FRAMES);
+              b->mAudioDataByteSize = AUDIO_FRAMES * 4;
+              AudioQueueEnqueueBuffer(q, b, 0, NULL);
+          }
+          static void audio_start(void)
+          {
+              [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+              [[AVAudioSession sharedInstance] setActive:YES error:nil];
+              AudioStreamBasicDescription f = {0};
+              f.mSampleRate = 44100; f.mFormatID = kAudioFormatLinearPCM;
+              f.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+              f.mBitsPerChannel = 16; f.mChannelsPerFrame = 2; f.mBytesPerFrame = 4;
+              f.mFramesPerPacket = 1; f.mBytesPerPacket = 4;
+              if (AudioQueueNewOutput(&f, aq_cb, NULL, NULL, NULL, 0, &g_aq) != noErr) { nfs_host_log("[AUDIO] failed"); return; }
+              for (int i = 0; i < 4; i++) {
+                  AudioQueueBufferRef b; AudioQueueAllocateBuffer(g_aq, AUDIO_FRAMES * 4, &b);
+                  memset(b->mAudioData, 0, AUDIO_FRAMES * 4); b->mAudioDataByteSize = AUDIO_FRAMES * 4;
+                  AudioQueueEnqueueBuffer(g_aq, b, 0, NULL);
+              }
+              AudioQueueStart(g_aq, NULL);
+          }
+
+          /* ---------------------------------------------------------------- touch overlay */
+          typedef struct { uint32_t mask; CGPoint c; CGFloat r; const char *label; } Btn;
+
+          @interface PadView : UIView
+          @end
+          @implementation PadView { Btn _b[8]; int _n; CGPoint _dp; CGFloat _dr; }
+          - (instancetype)initWithFrame:(CGRect)f
+          {
+              if ((self = [super initWithFrame:f])) {
+                  self.multipleTouchEnabled = YES; self.opaque = NO;
+                  self.backgroundColor = [UIColor clearColor];
+              }
+              return self;
+          }
+          /* Racing layout: steering pad left; gas (A) / brake (B) / C right; shift L/R on the top corners;
+           * Play (P) and Stop (X) bottom centre. */
+          - (void)layoutSubviews
+          {
+              CGFloat W = self.bounds.size.width, H = self.bounds.size.height, u = MIN(W, H) / 768.0;
+              _dp = CGPointMake(190 * u, H - 190 * u); _dr = 120 * u;
+              CGFloat fx = W - 190 * u;
+              _n = 0;
+              _b[_n++] = (Btn){ NFS_PAD_A, CGPointMake(fx + 60 * u, H - 230 * u), 62 * u, "A" };
+              _b[_n++] = (Btn){ NFS_PAD_B, CGPointMake(fx - 80 * u, H - 130 * u), 46 * u, "B" };
+              _b[_n++] = (Btn){ NFS_PAD_C, CGPointMake(fx - 90 * u, H - 270 * u), 40 * u, "C" };
+              _b[_n++] = (Btn){ NFS_PAD_L, CGPointMake(90 * u, 70 * u), 50 * u, "L" };
+              _b[_n++] = (Btn){ NFS_PAD_R, CGPointMake(W - 90 * u, 70 * u), 50 * u, "R" };
+              _b[_n++] = (Btn){ NFS_PAD_P, CGPointMake(W / 2 + 70 * u, H - 40 * u), 34 * u, "P" };
+              _b[_n++] = (Btn){ NFS_PAD_X, CGPointMake(W / 2 - 70 * u, H - 40 * u), 34 * u, "X" };
+              [self setNeedsDisplay];
+          }
+          - (void)drawRect:(CGRect)r
+          {
+              CGContextRef g = UIGraphicsGetCurrentContext();
+              CGContextSetRGBStrokeColor(g, 1, 1, 1, 0.45); CGContextSetRGBFillColor(g, 1, 1, 1, 0.10);
+              CGContextSetLineWidth(g, 2);
+              CGContextAddEllipseInRect(g, CGRectMake(_dp.x - _dr, _dp.y - _dr, _dr * 2, _dr * 2));
+              CGContextDrawPath(g, kCGPathFillStroke);
+              for (int i = 0; i < _n; i++) {
+                  CGContextAddEllipseInRect(g, CGRectMake(_b[i].c.x - _b[i].r, _b[i].c.y - _b[i].r, _b[i].r * 2, _b[i].r * 2));
+                  CGContextDrawPath(g, kCGPathFillStroke);
+                  NSString *s = [NSString stringWithUTF8String:_b[i].label];
+                  NSDictionary *at = @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:MAX(12, _b[i].r * 0.55)],
+                                        NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.6] };
+                  CGSize z = [s sizeWithAttributes:at];
+                  [s drawAtPoint:CGPointMake(_b[i].c.x - z.width / 2, _b[i].c.y - z.height / 2) withAttributes:at];
+              }
+          }
+          - (void)recompute:(NSSet *)all
+          {
+              uint32_t m = 0;
+              for (UITouch *t in all) {
+                  if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) continue;
+                  CGPoint p = [t locationInView:self];
+                  CGFloat dx = p.x - _dp.x, dy = p.y - _dp.y, d = hypot(dx, dy);
+                  if (d < _dr * 1.3 && d > _dr * 0.15) {
+                      CGFloat a = atan2(dy, dx);
+                      if (cos(a) > 0.38) m |= NFS_PAD_RIGHT;
+                      if (cos(a) < -0.38) m |= NFS_PAD_LEFT;
+                      if (sin(a) > 0.38) m |= NFS_PAD_DOWN;
+                      if (sin(a) < -0.38) m |= NFS_PAD_UP;
+                  }
+                  for (int i = 0; i < _n; i++)
+                      if (hypot(p.x - _b[i].c.x, p.y - _b[i].c.y) <= _b[i].r * 1.25) m |= _b[i].mask;
+              }
+              g_touch_mask = m; pad_recompute();
+          }
+          - (void)touchesBegan:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesMoved:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesEnded:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          - (void)touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e { [self recompute:[e allTouches]]; }
+          @end
+
+          /* ---------------------------------------------------------------- MFi pad */
+          static void gc_attach(GCController *c)
+          {
+              GCExtendedGamepad *x = c.extendedGamepad;
+              if (!x) return;
+              x.valueChangedHandler = ^(GCExtendedGamepad *p, GCControllerElement *el) {
+                  uint32_t m = 0;
+                  if (p.dpad.up.pressed) m |= NFS_PAD_UP;
+                  if (p.dpad.down.pressed) m |= NFS_PAD_DOWN;
+                  if (p.dpad.left.pressed || p.leftThumbstick.left.value > 0.4) m |= NFS_PAD_LEFT;
+                  if (p.dpad.right.pressed || p.leftThumbstick.right.value > 0.4) m |= NFS_PAD_RIGHT;
+                  if (p.buttonA.pressed || p.rightTrigger.value > 0.3) m |= NFS_PAD_A;   /* gas */
+                  if (p.buttonB.pressed || p.leftTrigger.value > 0.3) m |= NFS_PAD_B;    /* brake */
+                  if (p.buttonX.pressed) m |= NFS_PAD_C;
+                  if (p.buttonY.pressed) m |= NFS_PAD_P;
+                  if (p.leftShoulder.pressed) m |= NFS_PAD_L;
+                  if (p.rightShoulder.pressed) m |= NFS_PAD_R;
+                  g_gc_mask = m; pad_recompute();
+              };
+          }
+
+          /* ---------------------------------------------------------------- fatal */
+          void nfs_host_fatal(const char *msg)
+          {
+              nfs_host_log("[FATAL] %s", msg);
+              NSString *s = [NSString stringWithUTF8String:msg];
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIAlertView *a = [[UIAlertView alloc] initWithTitle:@"Need for Speed" message:s delegate:nil
+                                                    cancelButtonTitle:@"OK" otherButtonTitles:nil];
+                  [a show];
+              });
+              nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq);
+              for (;;) sleep(3600);
+          }
+
+          /* ---------------------------------------------------------------- app */
+          @interface RootVC : UIViewController
+          @end
+          @implementation RootVC
+          - (BOOL)prefersStatusBarHidden { return YES; }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (void)loadView
+          {
+              CGRect b = [UIScreen mainScreen].bounds;
+              if (b.size.width < b.size.height) b = CGRectMake(0, 0, b.size.height, b.size.width);
+              UIView *root = [[UIView alloc] initWithFrame:b]; root.backgroundColor = [UIColor blackColor];
+              g_glview = [[GLView alloc] initWithFrame:b];
+              g_glview.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [root addSubview:g_glview];
+              PadView *pad = [[PadView alloc] initWithFrame:b];
+              pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [root addSubview:pad];
+              self.view = root;
+          }
+          @end
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+          @implementation AppDelegate
+          - (void)emuMain:(id)arg
+          {
+              @autoreleasepool { audio_start(); }
+              int rc = nfs_core_run(g_disc, g_nvram);
+              nfs_host_fatal(rc ? "core stopped with an error (see nfs.log)" : "game returned");
+          }
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts
+          {
+              NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+              snprintf(g_docs, sizeof g_docs, "%s", docs.UTF8String);
+              snprintf(g_disc, sizeof g_disc, "%s/disc", g_docs);       /* the extracted disc tree */
+              snprintf(g_nvram, sizeof g_nvram, "%s/nvram", g_docs);
+              snprintf(g_logpath, sizeof g_logpath, "%s/nfs.log", g_docs);
+              mkdir(g_nvram, 0755);
+
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              self.window.rootViewController = [RootVC new];
+              [self.window makeKeyAndVisible];
+              app.idleTimerDisabled = YES;
+              [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil
+                  queue:nil usingBlock:^(NSNotification *n) { gc_attach(n.object); }];
+              for (GCController *c in [GCController controllers]) gc_attach(c);
+
+              char probe[700]; snprintf(probe, sizeof probe, "%s/LaunchMe", g_disc);
+              if (access(probe, R_OK) != 0) {
+                  UILabel *l = [[UILabel alloc] initWithFrame:self.window.bounds];
+                  l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; l.textColor = [UIColor whiteColor];
+                  l.text = @"Put the extracted disc tree of your own\nThe Need for Speed (3DO) into\nDocuments/disc/ (LaunchMe, frontovl, ...)\nand relaunch.";
+                  [self.window.rootViewController.view addSubview:l];
+                  return YES;
+              }
+              nfs_host_log("---- launch, disc=%s", g_disc);
+              NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(emuMain:) object:nil];
+              t.stackSize = 16 * 1024 * 1024; t.name = @"emu"; [t start];
+              return YES;
+          }
+          - (void)applicationWillResignActive:(UIApplication *)a { nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq); }
+          - (void)applicationDidBecomeActive:(UIApplication *)a { nfs_paused = 0; if (g_aq) AudioQueueStart(g_aq, NULL); }
+          @end
+
+          int main(int argc, char *argv[])
+          {
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class])); }
+          }
+          NFS_EOF
+          mkdir -p "$(dirname "$P/host/ios_availability_stub.m")"
+          cat > "$P/host/ios_availability_stub.m" <<'NFS_EOF'
+          /*
+           * ___isPlatformVersionAtLeast is a compiler-rt builtin clang emits for
+           * @available(...)/API_AVAILABLE checks. This toolchain's prebuilt
+           * libSDL2.a was compiled against a clang that assumes it's always
+           * present at link time (normally supplied by Apple's compiler-rt on a
+           * real Xcode toolchain), but this bare Linux->iOS cross-toolchain
+           * doesn't ship a compiler-rt archive at all - so the symbol is simply
+           * never linked in.
+           *
+           * Both call sites that need it (SDL_HideHomeIndicatorHintChanged and
+           * UIKit_ShowMessageBoxAlertController, both in SDL2's UIKit backend)
+           * only use it to guard iOS 11+/13+ API calls. Since this whole build
+           * targets iPhoneOS 9.3, any real OS this binary ever runs on that is
+           * newer than 9.3 should still report "yes, at least" for those
+           * checks correctly - so a full platform/version parser isn't needed,
+           * just something that answers consistently with the real runtime
+           * version already available via -[UIDevice systemVersion].
+           *
+           * Clang's ABI for this builtin (see clang/lib/CodeGen/CGObjC.cpp,
+           * EmitAvailabilityCheck): int32_t platform, then three components
+           * (major, minor, subminor) of the version being checked against.
+           * Returning 1 when the running OS's version >= the requested version
+           * matches real semantics; the SDL call sites already gate their own
+           * logic on this, so this stub just needs to answer correctly rather
+           * than unconditionally return true.
+           */
+          #import <UIKit/UIKit.h>
+
+          int32_t __isPlatformVersionAtLeast(int32_t platform, int32_t major, int32_t minor, int32_t subminor) {
+              (void)platform; /* single-platform (iOS) build; ignore platform id */
+
+              NSString *sysVersion = [[UIDevice currentDevice] systemVersion];
+              NSArray<NSString *> *parts = [sysVersion componentsSeparatedByString:@"."];
+
+              int32_t runningMajor = parts.count > 0 ? [parts[0] intValue] : 0;
+              int32_t runningMinor = parts.count > 1 ? [parts[1] intValue] : 0;
+              int32_t runningSubminor = parts.count > 2 ? [parts[2] intValue] : 0;
+
+              if (runningMajor != major) return runningMajor > major;
+              if (runningMinor != minor) return runningMinor > minor;
+              return runningSubminor >= subminor;
+          }
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Makefile")"
+          cat > "$P/Makefile" <<'NFS_EOF'
+          # The Need for Speed (3DO) -> iOS 7.0-9.3.5, armv7 (32-bit). Theos project, same toolchain as
+          # CrashBandicoot.Native. Core = 3dokit-recompiled C++ + the Portfolio runtime (pfboot) WITHOUT its
+          # SDL3 front end; host/ios_host.m replaces that front end (see docs/PORTING.md).
+          export THEOS_DEVICE_IP =
+          ARCHS = armv7
+          TARGET = iphone:clang:9.3:7.0
+          INSTALL_TARGET_PROCESSES = NeedForSpeed3DO
+
+          include $(THEOS)/makefiles/common.mk
+          APPLICATION_NAME = NeedForSpeed3DO
+
+          # build/recomp/*.cpp     generated by `python -m 3dokit.recomp` from YOUR disc (never committed)
+          # core/*.cpp             3dokit's Portfolio runtime + pfboot core, copied from the 3dokit submodule
+          # core/nfs_core_glue.cpp wraps pfboot's main loop as nfs_core_run / nfs_core_audio_mix
+          NeedForSpeed3DO_FILES = $(wildcard build/recomp/*.cpp) $(wildcard core/*.cpp) \
+          	host/ios_host.m host/ios_availability_stub.m
+          ios_host.m_CFLAGS += -fobjc-arc
+
+          # C++14 only: the 9.3 SDK's libc++ has no <filesystem>; thread_local needs iOS 9+; aligned new iOS 11+.
+          ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-maps \
+          	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
+          	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing
+          NeedForSpeed3DO_CXXFLAGS = -std=c++14 -stdlib=libc++ -Ihost -Icore -Ibuild/recomp -DNFS_IOS7=1 -DNDEBUG
+          NeedForSpeed3DO_CFLAGS = -Ihost -std=gnu11 -DNDEBUG
+
+          # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
+          core/pf_cel.cpp_CXXFLAGS += -O3
+          core/pf_dsp.cpp_CXXFLAGS += -O3
+
+          NeedForSpeed3DO_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore \
+          	-framework CoreGraphics -framework OpenGLES -framework AudioToolbox -framework AVFoundation \
+          	-weak_framework GameController -lc++ -Wl,-dead_strip
+          NeedForSpeed3DO_CODESIGN_FLAGS = -SResources/entitlements.plist
+          NeedForSpeed3DO_PLIST = Resources/Info.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Resources/Info.plist")"
+          cat > "$P/Resources/Info.plist" <<'NFS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key><string>en</string>
+          	<key>CFBundleExecutable</key><string>NeedForSpeed3DO</string>
+          	<key>CFBundleIdentifier</key><string>com.example.nfs3do.armv7</string>
+          	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          	<key>CFBundleName</key><string>NFS 3DO</string>
+          	<key>CFBundleDisplayName</key><string>NFS 3DO</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleShortVersionString</key><string>0.1.0</string>
+          	<key>CFBundleVersion</key><string>1</string>
+          	<key>MinimumOSVersion</key><string>7.0</string>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
+          	<key>LSRequiresIPhoneOS</key><true/>
+          	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+          	<key>UISupportedInterfaceOrientations~ipad</key>
+          	<array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+          	<key>UIStatusBarHidden</key><true/>
+          	<key>UIViewControllerBasedStatusBarAppearance</key><false/>
+          	<key>UIRequiresFullScreen</key><true/>
+          	<key>UIFileSharingEnabled</key><true/>
+          	<key>UIBackgroundModes</key><array/>
+          </dict>
+          </plist>
+          NFS_EOF
+          mkdir -p "$(dirname "$P/Resources/entitlements.plist")"
+          cat > "$P/Resources/entitlements.plist" <<'NFS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>get-task-allow</key>
+          	<true/>
+          </dict>
+          </plist>
+          NFS_EOF
+          mkdir -p "$(dirname "$P/core/nfs_core_glue.cpp.template")"
+          cat > "$P/core/nfs_core_glue.cpp.template" <<'NFS_EOF'
+          // Template - rename to nfs_core_glue.cpp once 3dokit's pfboot sources are in core/.
+          // The 3dokit submodule was EMPTY in the archive I was given, so the pfboot names below are
+          // placeholders to be matched against its real main()/window/audio code.
+          #include "nfs_host.h"
+          // #include "pfboot.h"   // <- the runtime's own header
+
+          extern "C" int nfs_core_run(const char *disc_dir, const char *nvram_dir)
+          {
+              // pfboot's `main()` body for:  pfboot <disc_dir> --boot --trace 0 --nvram <nvram_dir>
+              //   1. no --window / no SDL: the runtime must call nfs_host_present() where it called SDL_UpdateTexture
+              //   2. the pad read (SDL keyboard -> 3DO pad) becomes:  uint32_t pad = nfs_pad_state;
+              //   3. pacing: use nfs_host_time_ns()/nfs_host_sleep_us(); idle while nfs_paused
+              //   4. SDL audio callback body -> nfs_core_audio_mix() below
+              (void)disc_dir; (void)nvram_dir;
+              nfs_host_log("nfs_core_run: pfboot not wired yet");
+              return 1;
+          }
+
+          extern "C" void nfs_core_audio_mix(int16_t *out, int frames)
+          {
+              // pull `frames` stereo frames from the DSP mixer; until wired, silence:
+              for (int i = 0; i < frames * 2; i++) out[i] = 0;
+          }
+          NFS_EOF
+          ls -R "$P"
+
+      - name: Collect core sources and check the glue
+        id: glue
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$P/build/recomp" "$P/core" "$WORK/diag"
+          cp build/recomp/*.cpp build/recomp/*.h "$P/build/recomp/" 2>/dev/null || true
+          # the runtime sources, wherever 3dokit keeps them (layout not known to this workflow's author)
+          find 3dokit build/recomp -name '*.cpp' -o -name '*.h' -o -name 'CMakeLists.txt' | sort > "$WORK/diag/files.txt"
+          grep -rl 'SDL' 3dokit build/recomp --include='*.cpp' --include='*.h' > "$WORK/diag/sdl-users.txt" || true
+          grep -rn 'int main *(' 3dokit build/recomp --include='*.cpp' > "$WORK/diag/mains.txt" || true
+          cat build/recomp/CMakeLists.txt > "$WORK/diag/recomp-CMakeLists.txt" 2>/dev/null || true
+          wc -l "$WORK"/diag/*.txt
+          if [ -f "$P/core/nfs_core_glue.cpp" ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::core/nfs_core_glue.cpp is not written yet: pfboot (SDL3) is not wired to host/nfs_host.h. Download the 'diagnostics' artifact and send it back; the Theos build is skipped until then."
+          fi
+
+      - name: Install Theos + iOS toolchain
+        if: steps.glue.outputs.ready == 'true'
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone" "$THEOS/sdks"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/tc.tar.xz
+          tar -xf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+          curl -fsSL -o /tmp/sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Build with Theos
+        if: steps.glue.outputs.ready == 'true'
+        working-directory: ${{ env.P }}
+        env:
+          FINALPACKAGE: "1"
+        run: |
+          set -euo pipefail
+          make clean || true
+          make package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log"
+          ls -la packages
+
+      - name: Pack .ipa
+        if: steps.glue.outputs.ready == 'true'
+        working-directory: ${{ env.P }}
+        run: |
+          set -euo pipefail
+          APP="$(find .theos -type d -name NeedForSpeed3DO.app | head -n1)"
+          [ -n "$APP" ] || { echo "::error::NeedForSpeed3DO.app not found"; exit 1; }
+          rm -rf ipa && mkdir -p ipa/Payload packages
+          cp -a "$APP" ipa/Payload/
+          (cd ipa && zip -rq ../packages/NeedForSpeed3DO-armv7.ipa Payload)
+          ls -la packages
+
+      - uses: actions/upload-artifact@v4
+        if: steps.glue.outputs.ready == 'true'
+        with:
+          name: NeedForSpeed3DO-armv7-iOS7
+          path: |
+            ${{ env.P }}/packages/*.ipa
+            ${{ env.P }}/packages/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics
+          path: |
+            ${{ env.WORK }}/diag
+            ${{ env.WORK }}/recomp.log
+            ${{ env.WORK }}/theos.log
+          if-no-files-found: ignore
