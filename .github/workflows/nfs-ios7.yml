@@ -635,6 +635,16 @@ jobs:
           grep -rn 'int main *(' 3dokit build/recomp --include='*.cpp' > "$WORK/diag/mains.txt" || true
           cat build/recomp/CMakeLists.txt > "$WORK/diag/recomp-CMakeLists.txt" 2>/dev/null || true
           wc -l "$WORK"/diag/*.txt
+          echo "::group::files.txt";            cat "$WORK/diag/files.txt";            echo "::endgroup::"
+          echo "::group::mains.txt";            cat "$WORK/diag/mains.txt";            echo "::endgroup::"
+          echo "::group::sdl-users.txt";        cat "$WORK/diag/sdl-users.txt";        echo "::endgroup::"
+          echo "::group::recomp-CMakeLists.txt"; cat "$WORK/diag/recomp-CMakeLists.txt"; echo "::endgroup::"
+          for f in $(cut -d: -f1 "$WORK/diag/mains.txt" "$WORK/diag/sdl-users.txt" | sort -u); do
+            echo "::group::SDL/func lines in $f ($(wc -l < "$f") lines)"
+            grep -n -E 'SDL_|^[A-Za-z_][A-Za-z0-9_:<>\*& ]* [A-Za-z_][A-Za-z0-9_:]*\(.*\) *(const)? *\{?$|^#include' "$f" | head -250 || true
+            echo "::endgroup::"
+          done
+          echo "::group::recomp report.txt"; head -60 build/recomp/report.txt 2>/dev/null || true; echo "::endgroup::"
           if [ -f "$P/core/nfs_core_glue.cpp" ]; then echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
