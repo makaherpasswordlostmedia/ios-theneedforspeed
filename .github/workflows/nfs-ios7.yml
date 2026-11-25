@@ -67,6 +67,18 @@ jobs:
             "lmadm=build/disc/System/Programs/LMADM" "format=build/disc/System/Programs/FORMAT" 2>&1 | tee "$WORK/recomp.log"
           ls build/recomp | head -50
 
+      # The app boots the EXTRACTED disc from Documents/disc/ on the device (nothing of the game is inside the .ipa).
+      # Download this artifact, unzip it and copy its contents into the app's Documents/disc/ (LaunchMe must end up
+      # at Documents/disc/LaunchMe). It is your own disc's data: the artifact is private to this repo, delete it when done.
+      - name: Upload extracted disc (copy into the app's Documents/disc/)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFS-disc-for-Documents-disc
+          path: ${{ github.workspace }}/build/disc
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
+
       - name: Write project (host, Makefile, plist - all embedded in this file)
         run: |
           set -euo pipefail
