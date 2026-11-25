@@ -726,6 +726,165 @@ jobs:
               g_r.store(r + n, std::memory_order_release);
           }
           NFS_EOF
+          cat > "$P/core/fs_shim.h" <<'NFS_EOF'
+          // fs_shim.h - the slice of std::filesystem that pf_file.cpp uses, over POSIX.
+          // iOS 7's libc++.dylib has no filesystem library and the toolchain has none for armv7.
+          #pragma once
+          #include <cstdint>
+          #include <iterator>
+          #include <memory>
+          #include <string>
+          #include <system_error>
+          #include <dirent.h>
+          #include <sys/stat.h>
+
+          namespace fsshim {
+
+          class path {
+              std::string s_;
+          public:
+              path() = default;
+              path(const std::string& s) : s_(s) {}
+              path(const char* s) : s_(s) {}
+              const std::string& string() const { return s_; }
+              const std::string& native() const { return s_; }
+              std::string generic_string() const { return s_; }
+              const char* c_str() const { return s_.c_str(); }
+              operator std::string() const { return s_; }
+              bool empty() const { return s_.empty(); }
+              path filename() const { size_t p = s_.find_last_of('/'); return path(p == std::string::npos ? s_ : s_.substr(p + 1)); }
+              path parent_path() const { size_t p = s_.find_last_of('/'); return path(p == std::string::npos ? std::string() : s_.substr(0, p)); }
+              path extension() const { std::string f = filename().s_; size_t p = f.find_last_of('.'); return path(p == std::string::npos || p == 0 ? std::string() : f.substr(p)); }
+              path stem() const { std::string f = filename().s_; size_t p = f.find_last_of('.'); return path(p == std::string::npos || p == 0 ? f : f.substr(0, p)); }
+              path& operator/=(const path& o) {
+                  if (o.s_.empty()) return *this;
+                  if (o.s_[0] == '/') { s_ = o.s_; return *this; }
+                  if (!s_.empty() && s_.back() != '/') s_ += '/';
+                  s_ += o.s_;
+                  return *this;
+              }
+              friend path operator/(path a, const path& b) { a /= b; return a; }
+              friend bool operator==(const path& a, const path& b) { return a.s_ == b.s_; }
+              friend bool operator!=(const path& a, const path& b) { return a.s_ != b.s_; }
+              friend bool operator<(const path& a, const path& b) { return a.s_ < b.s_; }
+          };
+
+          class filesystem_error : public std::system_error {
+              path p_;
+          public:
+              filesystem_error(const std::string& what, const path& p, std::error_code ec) : std::system_error(ec, what), p_(p) {}
+              const path& path1() const { return p_; }
+          };
+
+          enum class file_type { none, not_found, regular, directory, symlink, unknown };
+          class file_status {
+              file_type t_;
+          public:
+              explicit file_status(file_type t = file_type::none) : t_(t) {}
+              file_type type() const { return t_; }
+          };
+
+          inline file_status status(const path& p) {
+              struct stat st;
+              if (::stat(p.c_str(), &st) != 0) return file_status(file_type::not_found);
+              return file_status(S_ISDIR(st.st_mode) ? file_type::directory : S_ISREG(st.st_mode) ? file_type::regular : file_type::unknown);
+          }
+          inline file_status status(const path& p, std::error_code& ec) { ec.clear(); return status(p); }
+          inline bool is_directory(const file_status& s) { return s.type() == file_type::directory; }
+          inline bool is_regular_file(const file_status& s) { return s.type() == file_type::regular; }
+          inline bool exists(const file_status& s) { return s.type() != file_type::none && s.type() != file_type::not_found; }
+          inline bool is_directory(const path& p) { return is_directory(status(p)); }
+          inline bool is_directory(const path& p, std::error_code& ec) { return is_directory(status(p, ec)); }
+          inline bool is_regular_file(const path& p) { return is_regular_file(status(p)); }
+          inline bool is_regular_file(const path& p, std::error_code& ec) { return is_regular_file(status(p, ec)); }
+          inline bool exists(const path& p) { return exists(status(p)); }
+          inline bool exists(const path& p, std::error_code& ec) { return exists(status(p, ec)); }
+
+          inline std::uintmax_t file_size(const path& p, std::error_code& ec) {
+              struct stat st;
+              if (::stat(p.c_str(), &st) != 0) { ec = std::error_code(errno, std::generic_category()); return static_cast<std::uintmax_t>(-1); }
+              ec.clear();
+              return static_cast<std::uintmax_t>(st.st_size);
+          }
+          inline std::uintmax_t file_size(const path& p) {
+              std::error_code ec;
+              std::uintmax_t n = file_size(p, ec);
+              if (ec) throw filesystem_error("file_size", p, ec);
+              return n;
+          }
+
+          class directory_entry {
+              fsshim::path p_;
+          public:
+              directory_entry() = default;
+              explicit directory_entry(const fsshim::path& p) : p_(p) {}
+              const fsshim::path& path() const { return p_; }
+              operator const fsshim::path&() const { return p_; }
+              file_status status() const { return fsshim::status(p_); }
+              bool is_directory() const { return fsshim::is_directory(p_); }
+              bool is_regular_file() const { return fsshim::is_regular_file(p_); }
+              bool exists() const { return fsshim::exists(p_); }
+              std::uintmax_t file_size() const { return fsshim::file_size(p_); }
+          };
+
+          class directory_iterator {
+              struct State {
+                  DIR* d = nullptr;
+                  fsshim::path dir;
+                  directory_entry cur;
+                  ~State() { if (d) ::closedir(d); }
+              };
+              std::shared_ptr<State> st_;
+              void advance() {
+                  while (struct dirent* e = ::readdir(st_->d)) {
+                      std::string n = e->d_name;
+                      if (n == "." || n == "..") continue;
+                      st_->cur = directory_entry(st_->dir / n);
+                      return;
+                  }
+                  st_.reset();
+              }
+              void open(const path& p, std::error_code& ec) {
+                  DIR* d = ::opendir(p.c_str());
+                  if (!d) { ec = std::error_code(errno, std::generic_category()); return; }
+                  ec.clear();
+                  st_ = std::make_shared<State>();
+                  st_->d = d;
+                  st_->dir = p;
+                  advance();
+              }
+          public:
+              using iterator_category = std::input_iterator_tag;
+              using value_type = directory_entry;
+              using difference_type = std::ptrdiff_t;
+              using pointer = const directory_entry*;
+              using reference = const directory_entry&;
+              directory_iterator() = default;
+              explicit directory_iterator(const path& p) { std::error_code ec; open(p, ec); if (ec) throw filesystem_error("directory_iterator", p, ec); }
+              directory_iterator(const path& p, std::error_code& ec) { open(p, ec); }
+              const directory_entry& operator*() const { return st_->cur; }
+              const directory_entry* operator->() const { return &st_->cur; }
+              directory_iterator& operator++() { advance(); return *this; }
+              directory_iterator& increment(std::error_code& ec) { ec.clear(); advance(); return *this; }
+              directory_iterator operator++(int) { directory_iterator t = *this; advance(); return t; }
+              friend bool operator==(const directory_iterator& a, const directory_iterator& b) { return a.st_ == b.st_; }
+              friend bool operator!=(const directory_iterator& a, const directory_iterator& b) { return a.st_ != b.st_; }
+          };
+          inline directory_iterator begin(directory_iterator it) { return it; }
+          inline directory_iterator end(const directory_iterator&) { return directory_iterator(); }
+
+          }  // namespace fsshim
+          NFS_EOF
+          cat > "$P/control" <<'CTL'
+          Package: com.example.nfs3do.armv7
+          Name: NFS 3DO
+          Version: 0.1.0
+          Architecture: iphoneos-arm
+          Description: The Need for Speed (3DO), static recompilation, iOS 7 armv7
+          Maintainer: local
+          Author: local
+          Section: Games
+          CTL
           ls -R "$P"
 
       - name: Collect core sources and check the glue
@@ -741,8 +900,14 @@ jobs:
             case "$(basename "$f")" in pf_window.cpp|arm_selftest.cpp|arm_stub.cpp) ;; *) cp "$f" "$P/core/" ;; esac
           done
           ls "$P/core"
+          echo "::group::pf_file.cpp filesystem usage"
+          grep -n -E "fs::|filesystem|directory_iterator|directory_entry|\\bpath\\b" 3dokit/runtime/pf_file.cpp | head -100 || true
+          echo "::endgroup::"
           sed -i -e 's/^int main(int argc, char\*\* argv) {/int pf_boot_main(int argc, char** argv) {/' -e '1i #define TDK_WINDOW 1' "$P/core/pf_main.cpp"
           grep -n "pf_boot_main\|TDK_WINDOW" "$P/core/pf_main.cpp" | head -5
+          # std::filesystem has no implementation for armv7 iOS 7: pf_file.cpp gets the POSIX shim instead
+          sed -i -e 's|#include <filesystem>|#include "fs_shim.h"|' -e 's|namespace fs = std::filesystem;|namespace fs = fsshim;|' "$P/core/pf_file.cpp"
+          grep -n "fs_shim\|fsshim\|std::filesystem" "$P/core/pf_file.cpp" | head -5
           python3 - "$P/core/pf_os.cpp" <<'PYEOF'
           import sys
           p = sys.argv[1]; s = open(p).read()
@@ -820,6 +985,7 @@ jobs:
           #define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
           #define _LIBCPP_PSTL_BACKEND_SERIAL
           #define _LIBCPP_PSTL_CPU_BACKEND_SERIAL
+          #define _LIBCPP_DISABLE_EXTERN_TEMPLATE
           #endif
           SITE
           fi
@@ -850,7 +1016,7 @@ jobs:
         working-directory: ${{ env.P }}
         run: |
           set -euo pipefail
-          APP="$(find .theos -type d -name NeedForSpeed3DO.app | head -n1)"
+          APP=".theos/obj/NeedForSpeed3DO.app"; [ -d "$APP" ] || APP="$(find .theos -type d -name NeedForSpeed3DO.app | head -n1)"
           [ -n "$APP" ] || { echo "::error::NeedForSpeed3DO.app not found"; exit 1; }
           rm -rf ipa && mkdir -p ipa/Payload packages
           cp -a "$APP" ipa/Payload/
