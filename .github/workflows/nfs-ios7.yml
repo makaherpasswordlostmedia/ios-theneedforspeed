@@ -120,6 +120,8 @@ jobs:
           void     nfs_host_sleep_us(unsigned us);
           void     nfs_host_log(const char *fmt, ...);
           void     nfs_host_fatal(const char *msg);
+          /* render thread, once, when the app goes inactive: finish the queued GL work */
+          void     nfs_host_idle(void);
 
           #ifdef __cplusplus
           }
@@ -177,7 +179,7 @@ jobs:
           static volatile uint32_t g_touch_mask, g_gc_mask;
           static void pad_recompute(void) { nfs_pad_state = g_touch_mask | g_gc_mask; }
 
-          /* ---------------------------------------------------------------- GL */
+          /* ---------------------------------------------------------------- GL (OpenGL ES 2.0) */
           @interface GLView : UIView
           @end
           @implementation GLView
@@ -187,85 +189,141 @@ jobs:
           static GLView *g_glview;
           static EAGLContext *g_ctx;
           static GLuint g_fbo, g_rbo, g_prog, g_tex, g_vbo;
-          static GLint g_vw, g_vh;
-          static int g_tex_w, g_tex_h;
+          static GLint g_vw, g_vh, g_u_isz, g_u_k;
+          static volatile int g_relayout = 1;      /* set on the main thread when the view's size changes; read by the render thread */
+
+          /* The field is 320 x (240 or so) RGB888. It lives in the corner of a 512 x 256 power-of-two texture
+           * (the PowerVR SGX of the iOS 7 devices likes those best); the vertex shader maps the quad onto that
+           * corner, the fragment shader shows it either plain bilinear or "sharp bilinear": texels stay crisp
+           * in the middle and blend only over about one screen pixel at their edges, so a 320-wide picture
+           * scaled 3x stays sharp without the blocky look of GL_NEAREST. */
+          #define TEX_W 512
+          #define TEX_H 256
 
           static const char *VS =
-              "attribute vec2 p; attribute vec2 t; varying mediump vec2 uv;"
+              "attribute vec2 p; attribute vec2 t; varying highp vec2 uv;"
               "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
-          /* the core hands RGB24 rows; uploaded as they are */
-          static const char *FS =
-              "varying mediump vec2 uv; uniform sampler2D s;"
-              "void main(){ gl_FragColor = vec4(texture2D(s, uv).rgb, 1.0); }";
+          static const char *FS_PLAIN =
+              "precision mediump float; varying highp vec2 uv; uniform sampler2D s;"
+              "uniform highp vec2 isz; uniform highp float k;"
+              "void main(){ gl_FragColor = vec4(texture2D(s, uv * isz / vec2(512.0, 256.0)).rgb, 1.0); }";
+          static const char *FS_SHARP =
+              "precision highp float; varying highp vec2 uv; uniform sampler2D s;"
+              "uniform vec2 isz; uniform float k;"
+              "void main(){"
+              "  vec2 texel = uv * isz;"
+              "  float range = 0.5 - 0.5 / k;"
+              "  vec2 d = fract(texel) - 0.5;"
+              "  vec2 f = (d - clamp(d, -range, range)) * k + 0.5;"
+              "  vec2 m = clamp(floor(texel) + f, vec2(0.5), isz - 0.5);"
+              "  gl_FragColor = vec4(texture2D(s, m / vec2(512.0, 256.0)).rgb, 1.0);"
+              "}";
 
           static GLuint compile(GLenum type, const char *src)
           {
               GLuint s = glCreateShader(type);
               glShaderSource(s, 1, &src, NULL); glCompileShader(s);
               GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-              if (!ok) { char b[512]; glGetShaderInfoLog(s, sizeof b, NULL, b); nfs_host_log("[GL] shader: %s", b); }
+              if (!ok) { char b[512]; glGetShaderInfoLog(s, sizeof b, NULL, b); nfs_host_log("[GL] shader: %s", b); glDeleteShader(s); return 0; }
               return s;
+          }
+
+          static GLuint link_program(const char *fs)
+          {
+              GLuint v = compile(GL_VERTEX_SHADER, VS), f = compile(GL_FRAGMENT_SHADER, fs);
+              if (!v || !f) return 0;
+              GLuint pr = glCreateProgram();
+              glAttachShader(pr, v); glAttachShader(pr, f);
+              glBindAttribLocation(pr, 0, "p"); glBindAttribLocation(pr, 1, "t");
+              glLinkProgram(pr);
+              glDeleteShader(v); glDeleteShader(f);
+              GLint ok = 0; glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+              if (!ok) { char b[512]; glGetProgramInfoLog(pr, sizeof b, NULL, b); nfs_host_log("[GL] link: %s", b); glDeleteProgram(pr); return 0; }
+              return pr;
+          }
+
+          /* (re)bind the drawable and lay the 4:3 picture out in it: letterboxed, full screen on a 4:3 iPad */
+          static void gl_layout(void)
+          {
+              __block CAEAGLLayer *layer = nil;
+              dispatch_sync(dispatch_get_main_queue(), ^{ layer = (CAEAGLLayer *)g_glview.layer; });
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              [g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer];
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_rbo);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_vw);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_vh);
+              float ar = (float)g_vw / (float)g_vh, sx = 1.f, sy = 1.f;
+              if (ar > 4.f / 3.f) sx = (4.f / 3.f) / ar; else sy = ar / (4.f / 3.f);
+              /* x y u v; v runs 0 at the top of the picture */
+              const float q[16] = { -sx,-sy, 0,1,   sx,-sy, 1,1,   -sx,sy, 0,0,   sx,sy, 1,0 };
+              glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+              glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STATIC_DRAW);
+              glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
+              glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+              /* screen pixels per source texel across, for the sharp filter (1 = plain bilinear) */
+              float k = (sx * (float)g_vw * 0.5f) / 160.f; if (k < 1.f) k = 1.f;
+              glUniform1f(g_u_k, k);
+              glViewport(0, 0, g_vw, g_vh);
+              g_relayout = 0;
+              nfs_host_log("[GL] drawable %dx%d, %.2f px per texel", g_vw, g_vh, k);
           }
 
           static void gl_setup(void)
           {
-              __block CAEAGLLayer *layer = nil;
               dispatch_sync(dispatch_get_main_queue(), ^{
-                  layer = (CAEAGLLayer *)g_glview.layer;
+                  CAEAGLLayer *layer = (CAEAGLLayer *)g_glview.layer;
                   layer.opaque = YES;
                   layer.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking: @NO,
                                                 kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGB565 };
               });
               g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
               [EAGLContext setCurrentContext:g_ctx];
-              glGenFramebuffers(1, &g_fbo); glGenRenderbuffers(1, &g_rbo);
-              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo); glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
-              [g_ctx renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer];
-              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_rbo);
-              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &g_vw);
-              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &g_vh);
+              nfs_host_log("[GL] %s / %s", (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
 
-              g_prog = glCreateProgram();
-              glAttachShader(g_prog, compile(GL_VERTEX_SHADER, VS));
-              glAttachShader(g_prog, compile(GL_FRAGMENT_SHADER, FS));
-              glBindAttribLocation(g_prog, 0, "p"); glBindAttribLocation(g_prog, 1, "t");
-              glLinkProgram(g_prog); glUseProgram(g_prog);
+              g_prog = link_program(FS_SHARP);
+              if (!g_prog) { nfs_host_log("[GL] sharp filter unavailable, plain bilinear"); g_prog = link_program(FS_PLAIN); }
+              if (!g_prog) nfs_host_fatal("GLES2 shaders failed (see nfs.log)");
+              glUseProgram(g_prog);
               glUniform1i(glGetUniformLocation(g_prog, "s"), 0);
+              g_u_isz = glGetUniformLocation(g_prog, "isz");
+              g_u_k = glGetUniformLocation(g_prog, "k");
 
-              /* 4:3 letterbox quad; full screen on a 4:3 iPad */
-              float ar = (float)g_vw / (float)g_vh, sx = 1.f, sy = 1.f;
-              if (ar > 4.f / 3.f) sx = (4.f / 3.f) / ar; else sy = ar / (4.f / 3.f);
-              const float q[16] = { -sx,-sy, 0,1,   sx,-sy, 1,1,   -sx,sy, 0,0,   sx,sy, 1,0 };
-              glGenBuffers(1, &g_vbo); glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-              glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STATIC_DRAW);
-              glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
-              glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+              glGenFramebuffers(1, &g_fbo); glGenRenderbuffers(1, &g_rbo); glGenBuffers(1, &g_vbo);
+              gl_layout();
 
+              glActiveTexture(GL_TEXTURE0);
               glGenTextures(1, &g_tex); glBindTexture(GL_TEXTURE_2D, g_tex);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-              glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
-              nfs_host_log("[GL] screen %dx%d", g_vw, g_vh);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              /* storage once, empty; every field after is a glTexSubImage2D of the rows it has */
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, TEX_W, TEX_H, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+              glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_DITHER); glDisable(GL_CULL_FACE);
+              glClearColor(0, 0, 0, 1);
+          }
+
+          /* the app is going to the background: the GPU must have nothing queued (iOS ends an app that
+           * touches GL there); called by the render thread */
+          void nfs_host_idle(void)
+          {
+              if (g_ctx) { [EAGLContext setCurrentContext:g_ctx]; glFinish(); }
           }
 
           void nfs_host_present(const uint8_t *px, int w, int h)
           {
-              while (nfs_paused) usleep(10000);            /* no GL while backgrounded: iOS kills the app */
+              if (nfs_paused) return;
               if (!g_ctx) gl_setup();
               [EAGLContext setCurrentContext:g_ctx];
+              if (g_relayout) gl_layout();
+              if (h > TEX_H) h = TEX_H;
+              if (w > TEX_W) w = TEX_W;
               glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-              glViewport(0, 0, g_vw, g_vh);
-              glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
-              glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_tex);
-              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-              if (w != g_tex_w || h != g_tex_h) {
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, px);
-                  g_tex_w = w; g_tex_h = h;
-              } else {
-                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
-              }
+              glClear(GL_COLOR_BUFFER_BIT);                     /* the letterbox bars; a clear costs nothing on a tiled GPU */
+              glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+              glUniform2f(g_u_isz, (GLfloat)w, (GLfloat)h);
               glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
               glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
               [g_ctx presentRenderbuffer:GL_RENDERBUFFER];
@@ -413,6 +471,7 @@ jobs:
           - (BOOL)prefersStatusBarHidden { return YES; }
           - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
           - (BOOL)shouldAutorotate { return YES; }
+          - (void)viewDidLayoutSubviews { g_relayout = 1; }
           - (void)loadView
           {
               CGRect b = [UIScreen mainScreen].bounds;
@@ -465,7 +524,7 @@ jobs:
               }
               nfs_host_log("---- launch, disc=%s", g_disc);
               NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(emuMain:) object:nil];
-              t.stackSize = 16 * 1024 * 1024; t.name = @"emu"; [t start];
+              t.stackSize = 16 * 1024 * 1024; t.name = @"emu"; t.threadPriority = 1.0; [t start];
               return YES;
           }
           - (void)applicationWillResignActive:(UIApplication *)a { nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq); }
@@ -547,7 +606,8 @@ jobs:
           # show which library features break; thread_local needs iOS 9+, aligned new iOS 11+.
           ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-maps \
           	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
-          	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing
+          	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing \
+          	-fno-stack-protector -fomit-frame-pointer -ffunction-sections -fdata-sections -mfpu=neon
           NeedForSpeed3DO_CCFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
           NeedForSpeed3DO_CXXFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
           NeedForSpeed3DO_CFLAGS = -I$(CURDIR)/host -I$(CURDIR)/core -I$(CURDIR)/build/recomp -DNDEBUG
@@ -555,6 +615,9 @@ jobs:
           # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
           core/pf_cel.cpp_CXXFLAGS += -O3
           core/pf_dsp.cpp_CXXFLAGS += -O3
+          core/pf_graphics.cpp_CXXFLAGS += -O3
+          core/pf_mem.cpp_CXXFLAGS += -O3
+          core/pf_os.cpp_CXXFLAGS += -O2
 
           NeedForSpeed3DO_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore \
           	-framework CoreGraphics -framework OpenGLES -framework AudioToolbox -framework AVFoundation \
@@ -620,6 +683,7 @@ jobs:
           #include "nfs_host.h"
           #include <atomic>
           #include <chrono>
+          #include <condition_variable>
           #include <functional>
           #include <mutex>
           #include <string>
@@ -650,7 +714,8 @@ jobs:
 
           // ---- video: the latest field, and the pace ----
           std::mutex g_lock;
-          std::vector<uint8_t> g_rgb;
+          std::condition_variable g_cv;
+          std::vector<uint8_t> g_rgb;                          // the latest field; swapped, never copied
           int g_lines;
           uint64_t g_seq;
           std::atomic<bool> g_stop{false};
@@ -662,13 +727,16 @@ jobs:
 
           // The program's thread, at each vertical blank (pf_window.cpp's window_vbl).
           void window_vbl(uint64_t when) {
-              std::vector<uint8_t> rgb;
+              static std::vector<uint8_t> work;                // kept between fields: no allocation after the first
               int lines;
-              if (pf_display_field(rgb, lines)) {
-                  std::lock_guard<std::mutex> l(g_lock);
-                  g_rgb.swap(rgb);
-                  g_lines = lines;
-                  ++g_seq;
+              if (pf_display_field(work, lines)) {
+                  {
+                      std::lock_guard<std::mutex> l(g_lock);
+                      g_rgb.swap(work);
+                      g_lines = lines;
+                      ++g_seq;
+                  }
+                  g_cv.notify_one();
               }
               pf_pad_live(nfs_pad_state);
               if (nfs_paused) {                                // backgrounded: hold the guest, count the clock again after
@@ -690,17 +758,25 @@ jobs:
               }
           }
 
+          // The only thread that touches GL. Wakes when a field is ready (no polling); the present itself
+          // waits for the display's vertical sync, so a slow GPU drops fields instead of queueing them.
           void render_loop() {
               std::vector<uint8_t> rgb;
               uint64_t shown = 0;
+              bool idle = false;
               while (!g_stop) {
                   int lines = 0;
                   {
-                      std::lock_guard<std::mutex> l(g_lock);
-                      if (g_seq != shown) { shown = g_seq; rgb = g_rgb; lines = g_lines; }
+                      std::unique_lock<std::mutex> l(g_lock);
+                      g_cv.wait_for(l, std::chrono::milliseconds(50), [&] { return g_seq != shown || g_stop; });
+                      if (g_seq != shown) { shown = g_seq; rgb.swap(g_rgb); lines = g_lines; }
                   }
+                  if (nfs_paused) {
+                      if (!idle) { nfs_host_idle(); idle = true; }
+                      continue;
+                  }
+                  idle = false;
                   if (lines) nfs_host_present(rgb.data(), 320, lines);
-                  nfs_host_sleep_us(4000);
               }
           }
 
@@ -907,6 +983,171 @@ jobs:
           Section: Games
           CTL
           ls -R "$P"
+
+      - name: Apply speed patches to 3dokit's runtime (cel engine, field conversion)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # bit-exact (checked against the original on random CCB lists): rectangle fast path,
+          # no frame-buffer read when the pixel processor ignores it, direct VRAM access, row-wise field conversion
+          cat > "$WORK/nfs-perf.patch" <<'PERF_EOF'
+          diff -u -r a/3dokit/runtime/pf_cel.cpp b/3dokit/runtime/pf_cel.cpp
+          --- a/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.243552891 +0000
+          +++ b/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.245160103 +0000
+          @@ -15,6 +15,8 @@
+           #include <cstdio>
+           #include <utility>
+ 
+          +#define ARM_LIKELY_IN(a) (__builtin_expect((a) + 4u <= ARM_MEM_SIZE, 1))
+          +
+           namespace {
+ 
+           enum : uint32_t {
+          @@ -49,7 +51,8 @@
+           // say: 0 here. Immercenary's full-screen LRFORM cels count 240 pairs (as Opera reads VCNT for
+           // LRFORM, the 3D view's 240 lines twice over), so their last 120 pairs run past VRAM's end -- rows
+           // that land below the clip and are never seen.
+          -uint32_t src_word(uint32_t a) {
+          +inline uint32_t src_word(uint32_t a) {
+          +    if (ARM_LIKELY_IN(a)) return ld32(a);
+               if (a + 4 > ARM_MEM_SIZE && a < PF_OS_BASE) {
+                   static bool told;
+                   if (!told && g_pf_trace) pf_log("        (the cel engine reads source data past VRAM, at %08X: 0)\n", a);
+          @@ -63,6 +66,12 @@
+           struct Bits {
+               uint32_t base, pos = 0;
+               uint32_t take(unsigned n) {
+          +        uint32_t off = pos & 31;
+          +        if (off + n <= 32) {                    // the common case: inside one word
+          +            uint32_t w = src_word(base + (pos >> 5) * 4);
+          +            pos += n;
+          +            return (w >> (32 - off - n)) & (n == 32 ? 0xFFFFFFFFu : ((1u << n) - 1));
+          +        }
+                   uint32_t v = 0;
+                   while (n) {
+                       uint32_t w = src_word(base + (pos >> 5) * 4), have = 32 - (pos & 31), k = n < have ? n : have;
+          @@ -84,12 +93,19 @@
+           uint32_t fb_addr(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+               return base + ((uint32_t)(y >> 1) * width + (uint32_t)x) * 4;
+           }
+          -uint32_t fb_read(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+          -    uint32_t w = pf_r32(fb_addr(base, width, x, y));
+          +inline uint32_t fb_read(uint32_t base, uint32_t width, int32_t x, int32_t y) {
+          +    uint32_t a = fb_addr(base, width, x, y);
+          +    uint32_t w = ARM_LIKELY_IN(a) ? ld32(a) : pf_r32(a);
+               return y & 1 ? w & 0xFFFF : w >> 16;
+           }
+          -void fb_write(uint32_t base, uint32_t width, int32_t x, int32_t y, uint32_t v) {
+          -    uint32_t a = fb_addr(base, width, x, y), w = pf_r32(a);
+          +inline void fb_write(uint32_t base, uint32_t width, int32_t x, int32_t y, uint32_t v) {
+          +    uint32_t a = fb_addr(base, width, x, y);
+          +    if (ARM_LIKELY_IN(a)) {
+          +        uint32_t w = ld32(a);
+          +        st32(a, y & 1 ? (w & 0xFFFF0000u) | v : (w & 0xFFFFu) | v << 16);
+          +        return;
+          +    }
+          +    uint32_t w = pf_r32(a);
+               pf_w32(a, y & 1 ? (w & 0xFFFF0000u) | v : (w & 0xFFFFu) | v << 16);
+           }
+ 
+          @@ -158,6 +174,7 @@
+           // plus one, sign-extended after that; the sum halved by 2D. Opera adds in 8 bits, so a large
+           // primary wraps negative there; here the sum is held within 0 to 31 whatever its size.
+           uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv, uint32_t flags) {
+          +    if ((mode & 0xFFC1u) == 0x1F00u && !(flags & (CCB_USEAV | CCB_PXOR))) return pix & 0x7FFFu;   // x8 >> 3, nothing added: the colour as it is
+               uint32_t s1 = mode >> 15 & 1, ms = mode >> 13 & 3, mf = mode >> 10 & 7, df = mode >> 8 & 3,
+                        s2 = mode >> 6 & 3, av = mode >> 1 & 31, d2 = mode & 1;
+               bool useav = flags & CCB_USEAV, pxor = flags & CCB_PXOR;
+          @@ -331,12 +348,31 @@
+                   if (!(dec & 0x7FFF) && !(cel.flags & CCB_BGND)) return;     // transparent, before the LSB
+                   uint32_t pix = blue_lsb(dec, lsb);
+                   uint32_t pm = pover == 2 ? 0 : pover == 3 ? 1 : pix >> 15;
+          -        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+          -            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          -            uint32_t fb = blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3);
+          -            uint32_t pp = ppmp(c, pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF, pix, fb, amv, cel.flags);
+          +        const uint32_t mode = pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF;
+          +        const bool needfb = (mode & 0x8000u) || (mode >> 6 & 3) == 2;       // the frame buffer pixel is a source of the pixel processor
+          +        auto plot = [&](int32_t x, int32_t y) {                              // inside the clip
+          +            uint32_t fb = needfb ? blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3) : 0;
+          +            uint32_t pp = ppmp(c, mode, pix, fb, amv, cel.flags);
+                       if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
+                       fb_write(t.write, t.width, x, y, vh_out(dec, pp));
+          +        };
+          +        // An upright rectangle (no turn, no bend: the usual cel) is fill_quad's walk in closed form:
+          +        // its two vertical edges, the one more to the left first, painted when the flag of the way
+          +        // that edge goes allows it; clipped once instead of at every pixel.
+          +        const int32_t x0 = qx[0] >> 16, x1 = qx[1] >> 16, y0 = qy[0] >> 16, y3 = qy[3] >> 16;
+          +        if (x0 == qx[3] >> 16 && x1 == qx[2] >> 16 && y0 == qy[1] >> 16 && y3 == qy[2] >> 16) {
+          +            if (x0 == x1 || y0 == y3) return;
+          +            bool down_first = x1 < x0 ? y3 > y0 : y0 > y3;                  // the left edge's way
+          +            if (!(cel.flags & (down_first ? CCB_ACCW : CCB_ACW))) return;
+          +            int32_t xa = std::max(std::min(x0, x1), 0), xb = std::min(std::max(x0, x1) - 1, t.xclip);
+          +            int32_t ya = std::max(std::min(y0, y3), 0), yb = std::min(std::max(y0, y3) - 1, t.yclip);
+          +            for (int32_t y = ya; y <= yb; ++y)
+          +                for (int32_t x = xa; x <= xb; ++x) plot(x, y);
+          +            return;
+          +        }
+          +        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+          +            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          +            plot(x, y);
+                   });
+               };
+ 
+          diff -u -r a/3dokit/runtime/pf_graphics.cpp b/3dokit/runtime/pf_graphics.cpp
+          --- a/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.247759661 +0000
+          +++ b/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.250569566 +0000
+          @@ -110,7 +110,7 @@
+               uint8_t clut[32][3] = {};
+               uint32_t cur = 0;
+               bool odd = false, picture = false;
+          -    rgb.clear();
+          +    rgb.resize(512u * 960u);                                // the most lines a field has; cut to size at the end
+               lines = 0;
+               for (int entries = 0; entries < 256; ++entries) {
+                   uint32_t w0 = pf_r32(e), n = w0 & 0x1ff, len = (w0 >> 9) & 0x3f;
+          @@ -127,17 +127,29 @@
+                   }
+                   for (uint32_t l = 0; l < n && (w0 & 0x00200000u) && picture; ++l) {
+                       if (++lines > 512) return false;
+          -            for (uint32_t x = 0; x < 320; ++x) {
+          -                uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
+          -                rgb.push_back(clut[(p >> 10) & 31][0]);
+          -                rgb.push_back(clut[(p >> 5) & 31][1]);
+          -                rgb.push_back(clut[p & 31][2]);
+          +            // the pen's colour in the three channels, once, then a row is table reads and stores
+          +            uint8_t* out = rgb.data() + (size_t)(lines - 1) * 960;
+          +            if (cur + 1280 <= ARM_MEM_SIZE) {
+          +                const uint8_t* src = g_arm_mem + cur;               // big-endian words, the even line in the high half
+          +                for (uint32_t x = 0; x < 320; ++x, src += 4, out += 3) {
+          +                    uint32_t p = odd ? src[2] << 8 | src[3] : src[0] << 8 | src[1];
+          +                    out[0] = clut[(p >> 10) & 31][0];
+          +                    out[1] = clut[(p >> 5) & 31][1];
+          +                    out[2] = clut[p & 31][2];
+          +                }
+          +            } else {
+          +                for (uint32_t x = 0; x < 320; ++x, out += 3) {
+          +                    uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
+          +                    out[0] = clut[(p >> 10) & 31][0];
+          +                    out[1] = clut[(p >> 5) & 31][1];
+          +                    out[2] = clut[p & 31][2];
+          +                }
+                       }
+                       if (odd) cur += 1280;
+                       odd = !odd;
+                   }
+                   e = pf_r32(e + 12);
+          -        if (e == first) return true;
+          +        if (e == first) { rgb.resize((size_t)lines * 960); return true; }
+               }
+               return false;
+           }
+          PERF_EOF
+          if patch -p1 --dry-run < "$WORK/nfs-perf.patch" >/dev/null; then
+            patch -p1 < "$WORK/nfs-perf.patch"
+          else
+            echo "::warning::speed patch does not apply to this 3dokit revision; building without it"
+          fi
 
       - name: Collect core sources and check the glue
         id: glue
