@@ -804,6 +804,25 @@ jobs:
             if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
           done
           find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+          # the toolchain ships a modern libc++ (<bit>, <filesystem>...) but not its generated __config_site
+          CXXH="$THEOS/toolchain/linux/iphone/include/c++/v1"
+          if [ -d "$CXXH" ] && [ ! -f "$CXXH/__config_site" ]; then
+          cat > "$CXXH/__config_site" <<'SITE'
+          #ifndef _LIBCPP___CONFIG_SITE
+          #define _LIBCPP___CONFIG_SITE
+          #define _LIBCPP_ABI_VERSION 1
+          #define _LIBCPP_ABI_NAMESPACE __1
+          #define _LIBCPP_HAS_THREAD_API_PTHREAD
+          #define _LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS
+          #endif
+          SITE
+          fi
+          echo "::group::toolchain libc++ info"
+          "$THEOS/toolchain/linux/iphone/bin/clang++" --version || true
+          grep -m3 -E "define _LIBCPP_VERSION|define _LIBCPP_ABI_VERSION" "$CXXH/__config" || true
+          ls "$CXXH" | head -20; ls "$CXXH" | wc -l
+          find "$THEOS/toolchain" "$THEOS/sdks" \( -name 'libc++*' -o -name 'libc++abi*' \) | head -20
+          echo "::endgroup::"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
       - name: Build with Theos
