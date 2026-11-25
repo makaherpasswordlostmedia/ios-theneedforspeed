@@ -84,13 +84,10 @@ jobs:
           #endif
 
           /* 3DO control pad bits (nfs_pad_state). In NFS: A = throttle, R = gear up. */
-          enum {
-              NFS_PAD_UP = 1u << 0,   NFS_PAD_DOWN = 1u << 1,
-              NFS_PAD_LEFT = 1u << 2, NFS_PAD_RIGHT = 1u << 3,
-              NFS_PAD_A = 1u << 4,    NFS_PAD_B = 1u << 5,   NFS_PAD_C = 1u << 6,
-              NFS_PAD_L = 1u << 7,    NFS_PAD_R = 1u << 8,
-              NFS_PAD_X = 1u << 9,    /* Stop */
-              NFS_PAD_P = 1u << 10    /* Play / Start */
+          enum {  /* the runtime's own ControlPadEventData bits (pf_window.cpp), handed to pf_pad_live as is */
+              NFS_PAD_DOWN = 0x80000000u, NFS_PAD_UP = 0x40000000u, NFS_PAD_RIGHT = 0x20000000u, NFS_PAD_LEFT = 0x10000000u,
+              NFS_PAD_A = 0x08000000u, NFS_PAD_B = 0x04000000u, NFS_PAD_C = 0x02000000u, NFS_PAD_P = 0x01000000u, /* Play */
+              NFS_PAD_X = 0x00800000u, /* Stop */ NFS_PAD_R = 0x00400000u, NFS_PAD_L = 0x00200000u
           };
 
           /* ---- the core implements these (pfboot's main loop, wrapped in core/nfs_core_glue.cpp) ---- */
@@ -105,8 +102,8 @@ jobs:
           extern volatile int      nfs_paused;      /* 1 while the app is inactive: the core must idle */
 
           /* ---- the host implements these; the core calls them ---- */
-          /* One finished frame (320x240), pixels little-endian 0xXXRRGGBB. */
-          void     nfs_host_present(const uint32_t *xrgb, int w, int h);
+          /* One finished field: w x h (w = 320), 3 bytes a pixel, R G B (pf_display_field). */
+          void     nfs_host_present(const uint8_t *rgb, int w, int h);
           uint64_t nfs_host_time_ns(void);
           void     nfs_host_sleep_us(unsigned us);
           void     nfs_host_log(const char *fmt, ...);
@@ -184,10 +181,10 @@ jobs:
           static const char *VS =
               "attribute vec2 p; attribute vec2 t; varying mediump vec2 uv;"
               "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
-          /* the core hands 0xXXRRGGBB little-endian = bytes B,G,R,X: swizzle on the GPU, no CPU pass */
+          /* the core hands RGB24 rows; uploaded as they are */
           static const char *FS =
               "varying mediump vec2 uv; uniform sampler2D s;"
-              "void main(){ gl_FragColor = vec4(texture2D(s, uv).bgr, 1.0); }";
+              "void main(){ gl_FragColor = vec4(texture2D(s, uv).rgb, 1.0); }";
 
           static GLuint compile(GLenum type, const char *src)
           {
@@ -241,7 +238,7 @@ jobs:
               nfs_host_log("[GL] screen %dx%d", g_vw, g_vh);
           }
 
-          void nfs_host_present(const uint32_t *px, int w, int h)
+          void nfs_host_present(const uint8_t *px, int w, int h)
           {
               while (nfs_paused) usleep(10000);            /* no GL while backgrounded: iOS kills the app */
               if (!g_ctx) gl_setup();
@@ -250,12 +247,12 @@ jobs:
               glViewport(0, 0, g_vw, g_vh);
               glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
               glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_tex);
-              glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
               if (w != g_tex_w || h != g_tex_h) {
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, px);
                   g_tex_w = w; g_tex_h = h;
               } else {
-                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
               }
               glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
               glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
@@ -544,7 +541,7 @@ jobs:
           # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
           core/pf_cel.cpp_CXXFLAGS += -O3
           core/pf_dsp.cpp_CXXFLAGS += -O3
-          core/pf_main.cpp_CXXFLAGS += -Dmain=pf_boot_main
+          core/pf_main.cpp_CXXFLAGS += -Dmain=pf_boot_main -DTDK_WINDOW=1
 
           NeedForSpeed3DO_LDFLAGS = -framework UIKit -framework Foundation -framework QuartzCore \
           	-framework CoreGraphics -framework OpenGLES -framework AudioToolbox -framework AVFoundation \
@@ -596,30 +593,136 @@ jobs:
           </dict>
           </plist>
           NFS_EOF
-          mkdir -p "$(dirname "$P/core/nfs_core_glue.cpp.template")"
-          cat > "$P/core/nfs_core_glue.cpp.template" <<'NFS_EOF'
-          // Template - rename to nfs_core_glue.cpp once 3dokit's pfboot sources are in core/.
-          // The 3dokit submodule was EMPTY in the archive I was given, so the pfboot names below are
-          // placeholders to be matched against its real main()/window/audio code.
+          mkdir -p "$(dirname "$P/core/nfs_core_glue.cpp")"
+          cat > "$P/core/nfs_core_glue.cpp" <<'NFS_EOF'
+          // nfs_core_glue.cpp - the iOS stand-in for 3dokit/runtime/pf_window.cpp (SDL3), and the two
+          // entry points host/ios_host.m calls. pf_main.cpp is built with -Dmain=pf_boot_main -DTDK_WINDOW=1,
+          // so `pfboot DISC --boot --window` ends up in pf_window_run() below instead of SDL.
+          //   video: the program's thread hands a field over at each vertical blank; a render thread
+          //          (the only one that touches GL) shows the latest one through nfs_host_present().
+          //   audio: pf_dsp pushes frames at the rate they play (g_pf_audio_out); the AudioQueue pulls them
+          //          from a ring in nfs_core_audio_mix().
+          //   pad:   nfs_pad_state holds the runtime's own button bits; handed to pf_pad_live every field.
+          #include "pf.h"
           #include "nfs_host.h"
-          // #include "pfboot.h"   // <- the runtime's own header
+          #include <atomic>
+          #include <chrono>
+          #include <functional>
+          #include <mutex>
+          #include <string>
+          #include <thread>
+          #include <vector>
 
-          extern "C" int nfs_core_run(const char *disc_dir, const char *nvram_dir)
-          {
-              // pfboot's `main()` body for:  pfboot <disc_dir> --boot --trace 0 --nvram <nvram_dir>
-              //   1. no --window / no SDL: the runtime must call nfs_host_present() where it called SDL_UpdateTexture
-              //   2. the pad read (SDL keyboard -> 3DO pad) becomes:  uint32_t pad = nfs_pad_state;
-              //   3. pacing: use nfs_host_time_ns()/nfs_host_sleep_us(); idle while nfs_paused
-              //   4. SDL audio callback body -> nfs_core_audio_mix() below
-              (void)disc_dir; (void)nvram_dir;
-              nfs_host_log("nfs_core_run: pfboot not wired yet");
-              return 1;
+          extern int pf_boot_main(int argc, char** argv);      // pf_main.cpp's main()
+
+          namespace {
+
+          // ---- audio ring: one producer (the program), one consumer (the AudioQueue) ----
+          constexpr size_t kRing = 1u << 15;                   // stereo frames, power of two
+          int16_t g_ring[kRing * 2];
+          std::atomic<size_t> g_w{0}, g_r{0};                  // free-running frame counters
+          bool g_primed;
+
+          void window_audio(const int16_t* lr, size_t frames) {
+              if (!g_primed) { g_primed = true; g_w.store(2646); }   // 60 ms of silence as the margin, as the SDL window did
+              size_t w = g_w.load(std::memory_order_relaxed), r = g_r.load(std::memory_order_acquire);
+              if (w - r > 44100 / 2 || w - r + frames > kRing) return;   // half a second queued: drop, the SDL window cleared its queue
+              for (size_t i = 0; i < frames; ++i) {
+                  size_t k = (w + i) & (kRing - 1);
+                  g_ring[k * 2] = lr[i * 2];
+                  g_ring[k * 2 + 1] = lr[i * 2 + 1];
+              }
+              g_w.store(w + frames, std::memory_order_release);
           }
 
-          extern "C" void nfs_core_audio_mix(int16_t *out, int frames)
-          {
-              // pull `frames` stereo frames from the DSP mixer; until wired, silence:
-              for (int i = 0; i < frames * 2; i++) out[i] = 0;
+          // ---- video: the latest field, and the pace ----
+          std::mutex g_lock;
+          std::vector<uint8_t> g_rgb;
+          int g_lines;
+          uint64_t g_seq;
+          std::atomic<bool> g_stop{false};
+
+          using Clock = std::chrono::steady_clock;
+          Clock::time_point g_host0;
+          uint64_t g_guest0;
+          bool g_started;
+
+          // The program's thread, at each vertical blank (pf_window.cpp's window_vbl).
+          void window_vbl(uint64_t when) {
+              std::vector<uint8_t> rgb;
+              int lines;
+              if (pf_display_field(rgb, lines)) {
+                  std::lock_guard<std::mutex> l(g_lock);
+                  g_rgb.swap(rgb);
+                  g_lines = lines;
+                  ++g_seq;
+              }
+              pf_pad_live(nfs_pad_state);
+              if (nfs_paused) {                                // backgrounded: hold the guest, count the clock again after
+                  while (nfs_paused) nfs_host_sleep_us(10000);
+                  g_started = false;
+              }
+              Clock::time_point now = Clock::now();
+              if (!g_started) {
+                  g_started = true;
+                  g_host0 = now;
+                  g_guest0 = when;
+                  return;
+              }
+              Clock::time_point due = g_host0 + std::chrono::nanoseconds(when - g_guest0);
+              if (due > now) std::this_thread::sleep_until(due);
+              else if (now - due > std::chrono::milliseconds(100)) {   // fell behind: count again from here
+                  g_host0 = now;
+                  g_guest0 = when;
+              }
+          }
+
+          void render_loop() {
+              std::vector<uint8_t> rgb;
+              uint64_t shown = 0;
+              while (!g_stop) {
+                  int lines = 0;
+                  {
+                      std::lock_guard<std::mutex> l(g_lock);
+                      if (g_seq != shown) { shown = g_seq; rgb = g_rgb; lines = g_lines; }
+                  }
+                  if (lines) nfs_host_present(rgb.data(), 320, lines);
+                  nfs_host_sleep_us(4000);
+              }
+          }
+
+          }  // namespace
+
+          // pf_main.cpp calls this (TDK_WINDOW) with the program's boot and run in `run`.
+          int pf_window_run(const char* title, const char* record, const std::function<int()>& run) {
+              (void)title; (void)record;                       // no --record on iOS
+              g_pf_audio_out = window_audio;
+              g_pf_display_vbl = window_vbl;
+              g_pf_wait_forever = true;
+              std::thread render(render_loop);
+              int r = run();
+              g_stop = true;
+              render.join();
+              return r;
+          }
+
+          extern "C" int nfs_core_run(const char* disc_dir, const char* nvram_dir) {
+              std::string d(disc_dir), n(nvram_dir);
+              std::vector<char*> a = { (char*)"pfboot", &d[0], (char*)"--boot", (char*)"--trace", (char*)"0",
+                                       (char*)"--nvram", &n[0], (char*)"--window" };
+              return pf_boot_main((int)a.size(), a.data());
+          }
+
+          extern "C" void nfs_core_audio_mix(int16_t* out, int frames) {
+              size_t r = g_r.load(std::memory_order_relaxed), w = g_w.load(std::memory_order_acquire);
+              size_t n = w - r < (size_t)frames ? w - r : (size_t)frames;
+              for (size_t i = 0; i < n; ++i) {
+                  size_t k = (r + i) & (kRing - 1);
+                  out[i * 2] = g_ring[k * 2];
+                  out[i * 2 + 1] = g_ring[k * 2 + 1];
+              }
+              for (size_t i = n * 2; i < (size_t)frames * 2; ++i) out[i] = 0;
+              g_r.store(r + n, std::memory_order_release);
           }
           NFS_EOF
           ls -R "$P"
@@ -636,6 +739,21 @@ jobs:
             case "$(basename "$f")" in pf_window.cpp|arm_selftest.cpp|arm_stub.cpp) ;; *) cp "$f" "$P/core/" ;; esac
           done
           ls "$P/core"
+          python3 - "$P/core/pf_os.cpp" <<'PYEOF'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          old = 'static thread_local uint32_t t_site;'
+          new = """#include <pthread.h>
+          struct TlsSite {   // thread_local needs iOS 9; this is the iOS 7 way
+              static pthread_key_t key() { static pthread_key_t k; static pthread_once_t o = PTHREAD_ONCE_INIT;
+                  pthread_once(&o, [] { pthread_key_create(&k, nullptr); }); return k; }
+              operator uint32_t() const { return (uint32_t)(uintptr_t)pthread_getspecific(key()); }
+              TlsSite& operator=(uint32_t v) { pthread_setspecific(key(), (void*)(uintptr_t)v); return *this; }
+          };
+          static TlsSite t_site;"""
+          if old in s: open(p, 'w').write(s.replace(old, new)); print("patched thread_local in pf_os.cpp")
+          else: print("::warning::thread_local line not found in pf_os.cpp")
+          PYEOF
           # the runtime sources, wherever 3dokit keeps them (layout not known to this workflow's author)
           find 3dokit build/recomp -name '*.cpp' -o -name '*.h' -o -name 'CMakeLists.txt' | sort > "$WORK/diag/files.txt"
           grep -rl 'SDL' 3dokit build/recomp --include='*.cpp' --include='*.h' > "$WORK/diag/sdl-users.txt" || true
@@ -695,7 +813,10 @@ jobs:
         run: |
           set -euo pipefail
           make clean || true
-          make package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log"
+          make package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log" || {
+            echo "::group::first errors"; grep -n -E "error:|undefined symbol|ld:" "$WORK/theos.log" | head -120; echo "::endgroup::"
+            exit 1
+          }
           ls -la packages
 
       - name: Pack .ipa
