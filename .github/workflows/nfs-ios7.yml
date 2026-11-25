@@ -726,6 +726,15 @@ jobs:
               g_r.store(r + n, std::memory_order_release);
           }
           NFS_EOF
+          cat > "$P/core/fstream_inst.cpp" <<'NFS_EOF'
+          // fstream_inst.cpp - the toolchain's modern <fstream> declares basic_filebuf/ifstream/ofstream<char> as
+          // `extern template`, expecting the dylib to define them. The iOS 7-9.3 libc++.dylib does not export these
+          // (link error: basic_filebuf::open / ctor / dtor, ifstream/ofstream vtable + VTT), so instantiate them here.
+          #include <fstream>
+          template class std::basic_filebuf<char>;
+          template class std::basic_ifstream<char>;
+          template class std::basic_ofstream<char>;
+          NFS_EOF
           cat > "$P/core/fs_shim.h" <<'NFS_EOF'
           // fs_shim.h - the slice of std::filesystem that pf_file.cpp uses, over POSIX.
           // iOS 7's libc++.dylib has no filesystem library and the toolchain has none for armv7.
