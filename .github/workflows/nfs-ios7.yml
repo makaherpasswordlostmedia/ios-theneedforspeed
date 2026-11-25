@@ -784,6 +784,7 @@ jobs:
           #include <vector>
 
           extern int pf_boot_main(int argc, char** argv);      // pf_main.cpp's main()
+          extern std::atomic<uint64_t> g_pf_ns_cel, g_pf_ns_dsp;   // pf_cel.cpp, pf_dsp.cpp: host ns spent, for [STAT]
 
           namespace {
 
@@ -814,7 +815,6 @@ jobs:
           std::atomic<bool> g_stop{false};
 
           // ---- counters for the once-a-second [STAT] line ----
-          extern std::atomic<uint64_t> g_pf_ns_cel, g_pf_ns_dsp;   // pf_cel.cpp, pf_dsp.cpp
           std::atomic<unsigned> g_n_fields{0}, g_n_shown{0};
           std::atomic<int64_t> g_behind_us{0}, g_field_us{0};   // last lateness against the host clock; field-build time summed
 
