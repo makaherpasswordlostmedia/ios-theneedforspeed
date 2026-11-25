@@ -536,7 +536,7 @@ jobs:
           	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
           	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing
           NeedForSpeed3DO_CXXFLAGS = -std=c++20 -stdlib=libc++ -Ihost -Icore -Ibuild/recomp -DNFS_IOS7=1 -DNDEBUG
-          NeedForSpeed3DO_CFLAGS = -Ihost -DNDEBUG
+          NeedForSpeed3DO_CFLAGS = -I$(CURDIR)/host -I$(CURDIR)/core -I$(CURDIR)/build/recomp -DNDEBUG
 
           # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
           core/pf_cel.cpp_CXXFLAGS += -O3
@@ -735,6 +735,7 @@ jobs:
           mkdir -p "$P/build/recomp" "$P/core" "$WORK/diag"
           cp build/recomp/*.cpp build/recomp/*.h "$P/build/recomp/" 2>/dev/null || true
           cp 3dokit/runtime/*.h "$P/core/"
+          cp 3dokit/runtime/*.h "$P/build/recomp/"   # generated files #include "arm60.h": found next to them
           for f in 3dokit/runtime/*.cpp; do
             case "$(basename "$f")" in pf_window.cpp|arm_selftest.cpp|arm_stub.cpp) ;; *) cp "$f" "$P/core/" ;; esac
           done
@@ -813,7 +814,7 @@ jobs:
         run: |
           set -euo pipefail
           make clean || true
-          make -k -j3 package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log" || {
+          make -k -j3 package FINALPACKAGE=1 messages=yes 2>&1 | tee "$WORK/theos.log" || {
             echo "::group::first errors"; grep -n -E "error:|undefined symbol|ld:" "$WORK/theos.log" | sed -e 's/\x1b\[[0-9;]*m//g' | cut -c1-260 | head -200; echo "::endgroup::"
             exit 1
           }
