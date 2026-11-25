@@ -528,7 +528,7 @@ jobs:
           # core/nfs_core_glue.cpp wraps pfboot's main loop as nfs_core_run / nfs_core_audio_mix
           NeedForSpeed3DO_FILES = $(wildcard build/recomp/*.cpp) $(wildcard core/*.cpp) \
           	host/ios_host.m host/ios_availability_stub.m
-          ios_host.m_CFLAGS += -fobjc-arc
+          NeedForSpeed3DO_OBJCFLAGS = -fobjc-arc -std=gnu11
 
           # The runtime is C++20 (recomp CMakeLists). The 9.3 SDK ships an OLD libc++ - the first Theos build will
           # show which library features break; thread_local needs iOS 9+, aligned new iOS 11+.
@@ -536,7 +536,7 @@ jobs:
           	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
           	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing
           NeedForSpeed3DO_CXXFLAGS = -std=c++20 -stdlib=libc++ -Ihost -Icore -Ibuild/recomp -DNFS_IOS7=1 -DNDEBUG
-          NeedForSpeed3DO_CFLAGS = -Ihost -std=gnu11 -DNDEBUG
+          NeedForSpeed3DO_CFLAGS = -Ihost -DNDEBUG
 
           # hot paths (cel projector, DSP interpreter) at -O3; the huge generated code stays at the default level
           core/pf_cel.cpp_CXXFLAGS += -O3
@@ -813,8 +813,8 @@ jobs:
         run: |
           set -euo pipefail
           make clean || true
-          make package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log" || {
-            echo "::group::first errors"; grep -n -E "error:|undefined symbol|ld:" "$WORK/theos.log" | head -120; echo "::endgroup::"
+          make -k -j3 package FINALPACKAGE=1 V=1 2>&1 | tee "$WORK/theos.log" || {
+            echo "::group::first errors"; grep -n -E "error:|undefined symbol|ld:" "$WORK/theos.log" | sed -e 's/\x1b\[[0-9;]*m//g' | cut -c1-260 | head -200; echo "::endgroup::"
             exit 1
           }
           ls -la packages
