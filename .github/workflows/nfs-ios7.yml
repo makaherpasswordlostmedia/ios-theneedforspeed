@@ -122,6 +122,9 @@ jobs:
           void     nfs_host_fatal(const char *msg);
           /* render thread, once, when the app goes inactive: finish the queued GL work */
           void     nfs_host_idle(void);
+          /* the core's once-a-second line; the crash log is installed at launch */
+          void     nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, int paused);
+          void     nfs_host_install_crash_log(void);
 
           #ifdef __cplusplus
           }
@@ -146,6 +149,12 @@ jobs:
           #include <unistd.h>
           #include <sys/stat.h>
           #include <mach/mach_time.h>
+          #include <mach-o/dyld.h>
+          #include <signal.h>
+          #include <execinfo.h>
+          #include <fcntl.h>
+          #include <sys/utsname.h>
+          #include <sys/ucontext.h>
           #include "nfs_host.h"
 
           volatile uint32_t nfs_pad_state;
@@ -174,6 +183,74 @@ jobs:
               return (tb.numer == tb.denom) ? t : t * tb.numer / tb.denom;
           }
           void nfs_host_sleep_us(unsigned us) { usleep(us); }
+
+          /* ---------------------------------------------------------------- crash log */
+          /* A crash writes to nfs.log: the signal, the fault address, the program counter, the thread and a
+           * backtrace, with the image's ASLR slide (symbolicate: atos -o NeedForSpeed3DO -l <load address>).
+           * Uncaught ObjC exceptions and the runtime's stderr (its "not yet" stops, pf_stop) land there too. */
+          static int g_crash_fd = -1;
+          static const char *sig_name(int s)
+          {
+              switch (s) { case SIGSEGV: return "SIGSEGV"; case SIGBUS: return "SIGBUS"; case SIGABRT: return "SIGABRT";
+                           case SIGILL: return "SIGILL"; case SIGFPE: return "SIGFPE"; case SIGTRAP: return "SIGTRAP"; }
+              return "?";
+          }
+          static void crash_handler(int sig, siginfo_t *si, void *uc)
+          {
+              char b[400], tn[64] = "?";
+              pthread_getname_np(pthread_self(), tn, sizeof tn);
+              unsigned long pc = 0, lr = 0;
+          #if defined(__arm__) || defined(__arm64__)
+              ucontext_t *u = (ucontext_t *)uc; pc = (unsigned long)u->uc_mcontext->__ss.__pc; lr = (unsigned long)u->uc_mcontext->__ss.__lr;
+          #endif
+              int n = snprintf(b, sizeof b, "\n[CRASH] %s (%d) code=%d fault_addr=%p pc=0x%lx lr=0x%lx thread='%s' slide=0x%lx\n",
+                               sig_name(sig), sig, si ? si->si_code : 0, si ? si->si_addr : 0, pc, lr, tn,
+                               (unsigned long)_dyld_get_image_vmaddr_slide(0));
+              if (g_crash_fd >= 0) {
+                  write(g_crash_fd, b, n);
+                  void *bt[64]; int c = backtrace(bt, 64);
+                  backtrace_symbols_fd(bt, c, g_crash_fd);
+                  fsync(g_crash_fd);
+              }
+              signal(sig, SIG_DFL); raise(sig);
+          }
+          static void exc_handler(NSException *e)
+          {
+              nfs_host_log("[EXCEPTION] %s: %s\n%s", e.name.UTF8String, e.reason.UTF8String,
+                           [[e callStackSymbols] componentsJoinedByString:@"\n"].UTF8String);
+          }
+          void nfs_host_install_crash_log(void)
+          {
+              g_crash_fd = open(g_logpath, O_WRONLY | O_APPEND | O_CREAT, 0644);
+              freopen(g_logpath, "a", stderr); setvbuf(stderr, NULL, _IOLBF, 0);   /* the runtime's stops */
+              freopen(g_logpath, "a", stdout); setvbuf(stdout, NULL, _IOLBF, 0);
+              static char altstack[64 * 1024];                                     /* a stack overflow can still be reported */
+              stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
+              sigaltstack(&ss, NULL);
+              struct sigaction sa; memset(&sa, 0, sizeof sa);
+              sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask);
+              int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTRAP };
+              for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+              NSSetUncaughtExceptionHandler(&exc_handler);
+          }
+          static void log_device_info(void)
+          {
+              struct utsname un; uname(&un);
+              UIDevice *d = [UIDevice currentDevice];
+              nfs_host_log("==== NFS 3DO launch %s ====", [[[NSDate date] description] UTF8String]);
+              nfs_host_log("[DEV] %s, iOS %s, %lu cores, %.0f MB RAM, screen %.0fx%.0f @%.0fx", un.machine, d.systemVersion.UTF8String,
+                           (unsigned long)[NSProcessInfo processInfo].activeProcessorCount,
+                           (double)[NSProcessInfo processInfo].physicalMemory / 1048576.0,
+                           [UIScreen mainScreen].bounds.size.width, [UIScreen mainScreen].bounds.size.height, [UIScreen mainScreen].scale);
+              nfs_host_log("[DEV] image slide 0x%lx", (unsigned long)_dyld_get_image_vmaddr_slide(0));
+          }
+
+          /* the core's once-a-second line: game fields per second, fields shown, how far the host clock is behind */
+          void nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, int paused)
+          {
+              nfs_host_log("[STAT] game %u fps, shown %u fps, host %s by %.0f ms, field build %.2f ms%s", fields, shown,
+                           behind_ms > 0 ? "behind" : "ahead", behind_ms > 0 ? behind_ms : -behind_ms, field_ms, paused ? ", PAUSED" : "");
+          }
 
           /* ---------------------------------------------------------------- pad */
           static volatile uint32_t g_touch_mask, g_gc_mask;
@@ -325,6 +402,7 @@ jobs:
               glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
               glUniform2f(g_u_isz, (GLfloat)w, (GLfloat)h);
               glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              { static int errs; GLenum e = glGetError(); if (e && errs < 20) { errs++; nfs_host_log("[GL] error 0x%x after draw", e); } }
               glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
               [g_ctx presentRenderbuffer:GL_RENDERBUFFER];
           }
@@ -494,7 +572,10 @@ jobs:
           - (void)emuMain:(id)arg
           {
               @autoreleasepool { audio_start(); }
+              pthread_setname_np("emu");
+              nfs_host_log("[CORE] start: disc=%s nvram=%s", g_disc, g_nvram);
               int rc = nfs_core_run(g_disc, g_nvram);
+              nfs_host_log("[CORE] returned %d", rc);
               nfs_host_fatal(rc ? "core stopped with an error (see nfs.log)" : "game returned");
           }
           - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts
@@ -505,6 +586,8 @@ jobs:
               snprintf(g_nvram, sizeof g_nvram, "%s/nvram", g_docs);
               snprintf(g_logpath, sizeof g_logpath, "%s/nfs.log", g_docs);
               mkdir(g_nvram, 0755);
+              nfs_host_install_crash_log();
+              log_device_info();
 
               self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
               self.window.rootViewController = [RootVC new];
@@ -527,8 +610,11 @@ jobs:
               t.stackSize = 16 * 1024 * 1024; t.name = @"emu"; t.threadPriority = 1.0; [t start];
               return YES;
           }
-          - (void)applicationWillResignActive:(UIApplication *)a { nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq); }
-          - (void)applicationDidBecomeActive:(UIApplication *)a { nfs_paused = 0; if (g_aq) AudioQueueStart(g_aq, NULL); }
+          - (void)applicationDidReceiveMemoryWarning:(UIApplication *)a { nfs_host_log("[MEM] memory warning"); }
+          - (void)applicationWillTerminate:(UIApplication *)a { nfs_host_log("[APP] will terminate"); }
+          - (void)applicationDidEnterBackground:(UIApplication *)a { nfs_host_log("[APP] background"); }
+          - (void)applicationWillResignActive:(UIApplication *)a { nfs_host_log("[APP] resign active"); nfs_paused = 1; if (g_aq) AudioQueuePause(g_aq); }
+          - (void)applicationDidBecomeActive:(UIApplication *)a { nfs_host_log("[APP] active"); nfs_paused = 0; if (g_aq) AudioQueueStart(g_aq, NULL); }
           @end
 
           int main(int argc, char *argv[])
@@ -683,6 +769,9 @@ jobs:
           #include "nfs_host.h"
           #include <atomic>
           #include <chrono>
+          #include <csignal>
+          #include <exception>
+          #include <typeinfo>
           #include <condition_variable>
           #include <functional>
           #include <mutex>
@@ -720,6 +809,23 @@ jobs:
           uint64_t g_seq;
           std::atomic<bool> g_stop{false};
 
+          // ---- counters for the once-a-second [STAT] line ----
+          std::atomic<unsigned> g_n_fields{0}, g_n_shown{0};
+          std::atomic<int64_t> g_behind_us{0}, g_field_us{0};   // last lateness against the host clock; field-build time summed
+
+          void stat_loop() {
+              int stalled = 0;
+              while (!g_stop) {
+                  std::this_thread::sleep_for(std::chrono::seconds(1));
+                  unsigned f = g_n_fields.exchange(0), s = g_n_shown.exchange(0);
+                  int64_t fu = g_field_us.exchange(0);
+                  nfs_host_stats(f, s, g_behind_us.load() / 1000.0, f ? fu / 1000.0 / f : 0.0, nfs_paused);
+                  if (!f && !nfs_paused) {
+                      if (++stalled == 5) nfs_host_log("[STALL] no field for 5 s: the guest is stuck or waiting (read the lines above)");
+                  } else stalled = 0;
+              }
+          }
+
           using Clock = std::chrono::steady_clock;
           Clock::time_point g_host0;
           uint64_t g_guest0;
@@ -729,7 +835,11 @@ jobs:
           void window_vbl(uint64_t when) {
               static std::vector<uint8_t> work;                // kept between fields: no allocation after the first
               int lines;
-              if (pf_display_field(work, lines)) {
+              uint64_t t0 = nfs_host_time_ns();
+              bool ok = pf_display_field(work, lines);
+              g_field_us += (int64_t)((nfs_host_time_ns() - t0) / 1000);
+              g_n_fields++;
+              if (ok) {
                   {
                       std::lock_guard<std::mutex> l(g_lock);
                       g_rgb.swap(work);
@@ -751,6 +861,7 @@ jobs:
                   return;
               }
               Clock::time_point due = g_host0 + std::chrono::nanoseconds(when - g_guest0);
+              g_behind_us = std::chrono::duration_cast<std::chrono::microseconds>(now - due).count();
               if (due > now) std::this_thread::sleep_until(due);
               else if (now - due > std::chrono::milliseconds(100)) {   // fell behind: count again from here
                   g_host0 = now;
@@ -776,7 +887,7 @@ jobs:
                       continue;
                   }
                   idle = false;
-                  if (lines) nfs_host_present(rgb.data(), 320, lines);
+                  if (lines) { nfs_host_present(rgb.data(), 320, lines); g_n_shown++; }
               }
           }
 
@@ -788,14 +899,28 @@ jobs:
               g_pf_audio_out = window_audio;
               g_pf_display_vbl = window_vbl;
               g_pf_wait_forever = true;
-              std::thread render(render_loop);
+              std::thread render(render_loop), stats(stat_loop);
               int r = run();
               g_stop = true;
+              stats.join();
               render.join();
               return r;
           }
 
+          static void on_terminate() {
+              std::string msg = "unknown";
+              if (auto ep = std::current_exception()) {
+                  try { std::rethrow_exception(ep); }
+                  catch (const std::exception& e) { msg = std::string(typeid(e).name()) + ": " + e.what(); }
+                  catch (...) { msg = "non-std exception"; }
+              }
+              nfs_host_log("[TERMINATE] uncaught C++ exception: %s", msg.c_str());
+              std::abort();                                    // the host's SIGABRT handler adds the backtrace
+          }
+
           extern "C" int nfs_core_run(const char* disc_dir, const char* nvram_dir) {
+              std::set_terminate(on_terminate);
+              nfs_host_log("[CORE] pf_boot_main begins");
               std::string d(disc_dir), n(nvram_dir);
               std::vector<char*> a = { (char*)"pfboot", &d[0], (char*)"--boot", (char*)"--trace", (char*)"0",
                                        (char*)"--nvram", &n[0], (char*)"--window" };
