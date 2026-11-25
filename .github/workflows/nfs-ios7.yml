@@ -123,7 +123,7 @@ jobs:
           /* render thread, once, when the app goes inactive: finish the queued GL work */
           void     nfs_host_idle(void);
           /* the core's once-a-second line; the crash log is installed at launch */
-          void     nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, int paused);
+          void     nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, double cel_ms, double dsp_ms, int paused);
           void     nfs_host_install_crash_log(void);
 
           #ifdef __cplusplus
@@ -246,10 +246,14 @@ jobs:
           }
 
           /* the core's once-a-second line: game fields per second, fields shown, how far the host clock is behind */
-          void nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, int paused)
+          void nfs_host_stats(unsigned fields, unsigned shown, double behind_ms, double field_ms, double cel_ms, double dsp_ms, int paused)
           {
-              nfs_host_log("[STAT] game %u fps, shown %u fps, host %s by %.0f ms, field build %.2f ms%s", fields, shown,
-                           behind_ms > 0 ? "behind" : "ahead", behind_ms > 0 ? behind_ms : -behind_ms, field_ms, paused ? ", PAUSED" : "");
+              /* per wall-clock second: ms in the cel engine, the DSP, the field conversion; the rest of the second is
+               * the recompiled ARM code, the OS runtime and waiting for the host clock */
+              double rest = 1000.0 - cel_ms - dsp_ms - field_ms * fields;
+              nfs_host_log("[STAT] game %u fps, shown %u fps | per second: cel %.0f ms, dsp %.0f ms, field %.0f ms, rest %.0f ms | host %s by %.0f ms%s",
+                           fields, shown, cel_ms, dsp_ms, field_ms * fields, rest < 0 ? 0 : rest,
+                           behind_ms > 0 ? "behind" : "ahead", behind_ms > 0 ? behind_ms : -behind_ms, paused ? " | PAUSED" : "");
           }
 
           /* ---------------------------------------------------------------- pad */
@@ -810,6 +814,7 @@ jobs:
           std::atomic<bool> g_stop{false};
 
           // ---- counters for the once-a-second [STAT] line ----
+          extern std::atomic<uint64_t> g_pf_ns_cel, g_pf_ns_dsp;   // pf_cel.cpp, pf_dsp.cpp
           std::atomic<unsigned> g_n_fields{0}, g_n_shown{0};
           std::atomic<int64_t> g_behind_us{0}, g_field_us{0};   // last lateness against the host clock; field-build time summed
 
@@ -819,7 +824,8 @@ jobs:
                   std::this_thread::sleep_for(std::chrono::seconds(1));
                   unsigned f = g_n_fields.exchange(0), s = g_n_shown.exchange(0);
                   int64_t fu = g_field_us.exchange(0);
-                  nfs_host_stats(f, s, g_behind_us.load() / 1000.0, f ? fu / 1000.0 / f : 0.0, nfs_paused);
+                  double cel = g_pf_ns_cel.exchange(0) / 1e6, dsp = g_pf_ns_dsp.exchange(0) / 1e6;
+                  nfs_host_stats(f, s, g_behind_us.load() / 1000.0, f ? fu / 1000.0 / f : 0.0, cel, dsp, nfs_paused);
                   if (!f && !nfs_paused) {
                       if (++stalled == 5) nfs_host_log("[STALL] no field for 5 s: the guest is stuck or waiting (read the lines above)");
                   } else stalled = 0;
@@ -923,7 +929,7 @@ jobs:
               nfs_host_log("[CORE] pf_boot_main begins");
               std::string d(disc_dir), n(nvram_dir);
               std::vector<char*> a = { (char*)"pfboot", &d[0], (char*)"--boot", (char*)"--trace", (char*)"0",
-                                       (char*)"--nvram", &n[0], (char*)"--window" };
+                                       (char*)"--nvram", &n[0], (char*)"--lenient", (char*)"--window" };
               return pf_boot_main((int)a.size(), a.data());
           }
 
@@ -1113,13 +1119,19 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          # bit-exact (checked against the original on random CCB lists): rectangle fast path,
+          # pf_os.cpp: a stop prints the last 48 OS calls first; --lenient says each unimplemented call once.
+          # the speed part is bit-exact (checked against the original on random CCB lists): rectangle fast path,
           # no frame-buffer read when the pixel processor ignores it, direct VRAM access, row-wise field conversion
           cat > "$WORK/nfs-perf.patch" <<'PERF_EOF'
           diff -u -r a/3dokit/runtime/pf_cel.cpp b/3dokit/runtime/pf_cel.cpp
-          --- a/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.243552891 +0000
-          +++ b/3dokit/runtime/pf_cel.cpp	2026-11-25 22:09:01.245160103 +0000
-          @@ -15,6 +15,8 @@
+          --- a/3dokit/runtime/pf_cel.cpp	2026-11-25 22:42:10.109799844 +0000
+          +++ b/3dokit/runtime/pf_cel.cpp	2026-11-25 22:42:10.111421228 +0000
+          @@ -12,9 +12,13 @@
+           // stops the run instead of guessing.
+           #include "pf.h"
+           #include <algorithm>
+          +#include <atomic>
+          +#include <chrono>
            #include <cstdio>
            #include <utility>
  
@@ -1128,7 +1140,7 @@ jobs:
            namespace {
  
            enum : uint32_t {
-          @@ -49,7 +51,8 @@
+          @@ -49,7 +53,8 @@
            // say: 0 here. Immercenary's full-screen LRFORM cels count 240 pairs (as Opera reads VCNT for
            // LRFORM, the 3D view's 240 lines twice over), so their last 120 pairs run past VRAM's end -- rows
            // that land below the clip and are never seen.
@@ -1138,7 +1150,7 @@ jobs:
                if (a + 4 > ARM_MEM_SIZE && a < PF_OS_BASE) {
                    static bool told;
                    if (!told && g_pf_trace) pf_log("        (the cel engine reads source data past VRAM, at %08X: 0)\n", a);
-          @@ -63,6 +66,12 @@
+          @@ -63,6 +68,12 @@
            struct Bits {
                uint32_t base, pos = 0;
                uint32_t take(unsigned n) {
@@ -1151,7 +1163,7 @@ jobs:
                    uint32_t v = 0;
                    while (n) {
                        uint32_t w = src_word(base + (pos >> 5) * 4), have = 32 - (pos & 31), k = n < have ? n : have;
-          @@ -84,12 +93,19 @@
+          @@ -84,12 +95,19 @@
            uint32_t fb_addr(uint32_t base, uint32_t width, int32_t x, int32_t y) {
                return base + ((uint32_t)(y >> 1) * width + (uint32_t)x) * 4;
            }
@@ -1175,7 +1187,7 @@ jobs:
                pf_w32(a, y & 1 ? (w & 0xFFFF0000u) | v : (w & 0xFFFFu) | v << 16);
            }
  
-          @@ -158,6 +174,7 @@
+          @@ -158,6 +176,7 @@
            // plus one, sign-extended after that; the sum halved by 2D. Opera adds in 8 bits, so a large
            // primary wraps negative there; here the sum is held within 0 to 31 whatever its size.
            uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv, uint32_t flags) {
@@ -1183,21 +1195,43 @@ jobs:
                uint32_t s1 = mode >> 15 & 1, ms = mode >> 13 & 3, mf = mode >> 10 & 7, df = mode >> 8 & 3,
                         s2 = mode >> 6 & 3, av = mode >> 1 & 31, d2 = mode & 1;
                bool useav = flags & CCB_USEAV, pxor = flags & CCB_PXOR;
-          @@ -331,12 +348,31 @@
+          @@ -303,17 +322,15 @@
+               // unless PRE1's NOSWAP; then B15POS (0, 1, or as it is) and B0POS (0, 1, the pixel processor's
+               // blue LSB, or as it is). The control word's CFBDSUB is not modelled (nor is it in Opera).
+               uint32_t origin_vh = ((uint32_t)g_ce.y >> 15 & 1) << 15 | ((uint32_t)g_ce.x >> 15 & 1);
+          -    auto vh_out = [&](uint32_t dec, uint32_t pp) {
+          +    // The V and H bits, in two parts: what the decoder or the origin gives (vh_pre, once for a source
+          +    // pixel) and B0POS, which may take the pixel processor's blue LSB (per painted pixel).
+          +    auto vh_pre = [&](uint32_t dec) {
+                   uint32_t vh = cel.flags & CCB_PLUTPOS ? dec & 0x8001u : origin_vh;
+                   if ((cec & SWAPHV) && !(!packed && (cel.pre1 & PRE1_NOSWAP))) vh = vh >> 15 | (vh & 1) << 15;
+                   switch (cec >> 30) { case 0: vh &= ~0x8000u; break; case 1: vh |= 0x8000u; break; }
+          -        switch (cec >> 28 & 3) {
+          -        case 0: vh &= ~1u; break;
+          -        case 1: vh |= 1; break;
+          -        case 2: vh = (vh & ~1u) | (pp & 1); break;
+          -        }
+          -        return (pp & 0x7FFEu) | vh;
+          +        return vh;
+               };
+          +    const uint32_t b0pos = cec >> 28 & 3;
+ 
+               int rows = ((int)(cel.pre0 >> 6 & 0x3FF) + 1) * (lrform ? 2 : 1);    // LRFORM's VCNT counts pairs
+               // The current source pixel's top-left and bottom-left corners, and the row's steps.
+          @@ -331,12 +348,58 @@
                    if (!(dec & 0x7FFF) && !(cel.flags & CCB_BGND)) return;     // transparent, before the LSB
                    uint32_t pix = blue_lsb(dec, lsb);
                    uint32_t pm = pover == 2 ? 0 : pover == 3 ? 1 : pix >> 15;
-          -        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
-          -            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
-          -            uint32_t fb = blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3);
-          -            uint32_t pp = ppmp(c, pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF, pix, fb, amv, cel.flags);
           +        const uint32_t mode = pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF;
           +        const bool needfb = (mode & 0x8000u) || (mode >> 6 & 3) == 2;       // the frame buffer pixel is a source of the pixel processor
+          +        const uint32_t vhp = vh_pre(dec);
           +        auto plot = [&](int32_t x, int32_t y) {                              // inside the clip
           +            uint32_t fb = needfb ? blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3) : 0;
           +            uint32_t pp = ppmp(c, mode, pix, fb, amv, cel.flags);
-                       if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
-                       fb_write(t.write, t.width, x, y, vh_out(dec, pp));
+          +            if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
+          +            uint32_t vh = vhp;
+          +            switch (b0pos) { case 0: vh &= ~1u; break; case 1: vh |= 1; break; case 2: vh = (vh & ~1u) | (pp & 1); break; }
+          +            fb_write(t.write, t.width, x, y, (pp & 0x7FFEu) | vh);
           +        };
           +        // An upright rectangle (no turn, no bend: the usual cel) is fill_quad's walk in closed form:
           +        // its two vertical edges, the one more to the left first, painted when the flag of the way
@@ -1213,15 +1247,95 @@ jobs:
           +                for (int32_t x = xa; x <= xb; ++x) plot(x, y);
           +            return;
           +        }
-          +        fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
-          +            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          +        // A trapezoid with a flat top and bottom (a strip bent by HDDX: the road, the floor): the same two
+          +        // edges, their x at each row from the same Bresenham-style quotient fill_quad takes.
+          +        const int32_t x2 = qx[2] >> 16, x3 = qx[3] >> 16;
+          +        if (y0 == qy[1] >> 16 && y3 == qy[2] >> 16) {
+          +            if (y0 == y3) return;
+          +            const bool a_down = y3 > y0;                                    // edge 1 -> 2 goes down when the bottom is below
+          +            const int32_t top = std::min(y0, y3), bot = std::max(y0, y3);
+          +            // edge A: corners 1 and 2; edge B: corners 3 and 0 (up when a_down)
+          +            const int32_t ahi_y = a_down ? y0 : y3, alo_y = a_down ? y3 : y0, ahi_x = a_down ? x1 : x2, alo_x = a_down ? x2 : x1;
+          +            const int32_t bhi_y = a_down ? y0 : y3, blo_y = a_down ? y3 : y0, bhi_x = a_down ? x0 : x3, blo_x = a_down ? x3 : x0;
+          +            const int32_t span = alo_y - ahi_y;
+          +            for (int32_t r = std::max(top, 0); r < bot && r <= t.yclip; ++r) {
+          +                int32_t xa = ahi_x + (int32_t)((int64_t)(alo_x - ahi_x) * (r - ahi_y) / span);
+          +                int32_t xb = bhi_x + (int32_t)((int64_t)(blo_x - bhi_x) * (r - bhi_y) / (blo_y - bhi_y));
+          +                // sorted by x, an edge going up first at a tie: A goes down when a_down, B goes up then
+          +                bool a_first = xa < xb || (xa == xb && !a_down);
+          +                int32_t lo = a_first ? xa : xb, hi = a_first ? xb : xa;
+          +                bool lo_down = a_first ? a_down : !a_down;
+          +                if (lo >= hi || !(cel.flags & (lo_down ? CCB_ACCW : CCB_ACW))) continue;
+          +                int32_t from = std::max(lo, 0), to = std::min(hi - 1, t.xclip);
+          +                for (int32_t px = from; px <= to; ++px) plot(px, r);
+          +            }
+          +            return;
+          +        }
+                   fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+                       if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          -            uint32_t fb = blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3);
+          -            uint32_t pp = ppmp(c, pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF, pix, fb, amv, cel.flags);
+          -            if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
+          -            fb_write(t.write, t.width, x, y, vh_out(dec, pp));
           +            plot(x, y);
                    });
                };
  
+          @@ -410,7 +473,7 @@
+           // one by; the flags say which words follow XPOS and YPOS (HDX to VDY, HDDX and HDDY, PIXC, then
+           // the preamble when CCBPRE), what is loaded, and whether the preamble opens the source data
+           // instead. LDPLUT loads 4 words of PLUT for 1 and 2 bits a pixel, 8 for 4, 16 for more.
+          -void pf_cel_draw(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+          +static void cel_draw_all(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+               static const uint32_t lo[16] = {0, 32, 512, 0, 256, 0, 0, 0, 1024}, hi[16] = {0, 64, 128, 0, 0, 0, 0, 0, 1024};
+               uint32_t r0 = regctl[0];
+               if ((r0 & 0xFF) != (r0 >> 8 & 0xFF) || (r0 >> 16)) pf_stop(c, "the cel engine: a read width other than the write width: not yet");
+          @@ -463,3 +526,12 @@
+                   ccb = pointer(ccb + 4, f & CCB_NPABS);
+               }
+           }
+          +
+          +// The host time the cel engine takes, for the host's stats (a CCB list is a hundred cels or so: one clock read each end).
+          +std::atomic<uint64_t> g_pf_ns_cel{0};
+          +void pf_cel_draw(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+          +    auto t0 = std::chrono::steady_clock::now();
+          +    struct Done { std::chrono::steady_clock::time_point t0; ~Done() {
+          +        g_pf_ns_cel += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } } done{t0};
+          +    cel_draw_all(c, cecontrol, regctl, ccb);
+          +}
+          diff -u -r a/3dokit/runtime/pf_dsp.cpp b/3dokit/runtime/pf_dsp.cpp
+          --- a/3dokit/runtime/pf_dsp.cpp	2026-11-25 22:42:10.118679924 +0000
+          +++ b/3dokit/runtime/pf_dsp.cpp	2026-11-25 22:42:10.120109310 +0000
+          @@ -32,6 +32,8 @@
+           // sounds the same every time, at any host speed. It goes to a WAV file (pfboot --wav) and to
+           // pfboot's window.
+           #include "pf.h"
+          +#include <chrono>
+          +#include <atomic>
+           #include <algorithm>
+           #include <cctype>
+           #include <cstdio>
+          @@ -44,6 +46,7 @@
+           #include <vector>
+ 
+           void (*g_pf_audio_out)(const int16_t* lr, size_t frames);
+          +std::atomic<uint64_t> g_pf_ns_dsp{0};          // host time spent in the DSP's frames (read by the host's stats)
+           void (*g_pf_dsp_ended)(int32_t ins, uint32_t rsrc);
+ 
+           namespace {
+          @@ -1214,7 +1217,9 @@
+               if (g_in_frame) return;
+               g_in_frame = true;
+               uint64_t due = pf_now() / 1000 * 441 / 10000;      // 44,100 frames a second of guest time
+          +    auto t0 = std::chrono::steady_clock::now();
+               while (g_frames < due) frame();
+          +    g_pf_ns_dsp += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+               g_in_frame = false;
+               if (g_out.empty()) return;
+               size_t n = g_out.size() / 2;
           diff -u -r a/3dokit/runtime/pf_graphics.cpp b/3dokit/runtime/pf_graphics.cpp
-          --- a/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.247759661 +0000
-          +++ b/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:09:01.250569566 +0000
+          --- a/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:42:10.112845994 +0000
+          +++ b/3dokit/runtime/pf_graphics.cpp	2026-11-25 22:42:10.114455787 +0000
           @@ -110,7 +110,7 @@
                uint8_t clut[32][3] = {};
                uint32_t cur = 0;
@@ -1267,6 +1381,67 @@ jobs:
                }
                return false;
            }
+          diff -u -r a/3dokit/runtime/pf_os.cpp b/3dokit/runtime/pf_os.cpp
+          --- a/3dokit/runtime/pf_os.cpp	2026-11-25 22:42:10.115835809 +0000
+          +++ b/3dokit/runtime/pf_os.cpp	2026-11-25 22:42:10.117204721 +0000
+          @@ -2,6 +2,7 @@
+           // their traps, the SWI and vector dispatch, the trace, and the boot. The
+           // folios' functions are in pf_kernel.cpp and the files after it.
+           #include "pf.h"
+          +#include <atomic>
+           #include <cstdarg>
+           #include <cstdio>
+           #include <cstdlib>
+          @@ -59,7 +60,28 @@
+           // as a register of its own, as launchme's sound code does.
+           static thread_local uint32_t t_site;
+ 
+          +// The last OS calls, kept so that a stop can say what led to it (printed by pf_stop, trace or no trace).
+          +namespace {
+          +struct RecentCall { const char* what; uint32_t site, r[4]; };
+          +constexpr unsigned kRecent = 48;
+          +RecentCall g_recent[kRecent];
+          +std::atomic<unsigned> g_recent_n{0};
+          +}
+          +
+           [[noreturn]] void pf_stop(ArmCpu& c, const char* why) {
+          +    unsigned n = g_recent_n.load();
+          +    pf_log("---- the last %u OS calls before the stop (oldest first) ----\n", n < kRecent ? n : kRecent);
+          +    for (unsigned i = n < kRecent ? 0 : n - kRecent; i < n; ++i) {
+          +        const RecentCall& r = g_recent[i % kRecent];
+          +        if (!r.what) continue;
+          +        char text[48] = "";
+          +        if (r.r[0] >= 0x1000 && r.r[0] < 0x300000) {         // a pointer into RAM that holds text: a path, a name
+          +            pf_cstring(r.r[0], text, sizeof text);
+          +            for (char* q = text; *q; ++q) if ((unsigned char)*q < 32 || (unsigned char)*q > 126) { *q = 0; break; }
+          +        }
+          +        pf_log("  #%u %06X %-34s r0=%08X r1=%08X r2=%08X r3=%08X%s%s%s\n", i, r.site, r.what, r.r[0], r.r[1], r.r[2], r.r[3],
+          +               text[0] ? "  \"" : "", text, text[0] ? "\"" : "");
+          +    }
+               arm_fault(c, t_site ? t_site : c.r[14], why);
+           }
+ 
+          @@ -144,6 +166,10 @@
+           static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const char* call) {
+               ++g_ncalls;
+               t_site = site;
+          +    {
+          +        unsigned i = g_recent_n.fetch_add(1);
+          +        g_recent[i % kRecent] = {what, site, {c.r[0], c.r[1], c.r[2], c.r[3]}};
+          +    }
+               if (g_pf_trace)
+                   pf_log("[%5llu] %06X %-40s r0=%08X r1=%08X r2=%08X r3=%08X\n", g_ncalls, site, what,
+                          c.r[0], c.r[1], c.r[2], c.r[3]);
+          @@ -152,7 +178,8 @@
+               if (snap) pf_snap_before(c, call);          // a call not implemented yet too: what it is given
+               if (!fn) {
+                   if (g_pf_lenient) {
+          -            pf_log("        (not implemented: returns 0)\n");
+          +            static unsigned told;                    // each distinct call said once, with where it came from
+          +            if (told++ < 64) pf_log("[lenient] %s not implemented, returns 0 (site %06X, r0=%08X)\n", what, site, c.r[0]);
+                       c.r[0] = 0;
+                       return;
+                   }
           PERF_EOF
           if patch -p1 --dry-run < "$WORK/nfs-perf.patch" >/dev/null; then
             patch -p1 < "$WORK/nfs-perf.patch"
