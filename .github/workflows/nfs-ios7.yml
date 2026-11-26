@@ -133,14 +133,14 @@ jobs:
           NFS_EOF
           mkdir -p "$(dirname "$P/host/ios_host.m")"
           cat > "$P/host/ios_host.m" <<'NFS_EOF'
-          /* ios_host.m - UIKit / EAGL (GLES2) / AudioQueue host for the NFS (3DO) core.
+          /* ios_host.m - UIKit / EAGL (GLES 3) / AudioQueue host for the NFS (3DO) core.
            * iOS 7.0-9.3.5, armv7, ARC on. Structure from CrashBandicoot.Native/host/ios_host.m:
            * the emulation thread owns GL, touch overlay, MFi pad, pause on resign-active. */
           #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
           #import <OpenGLES/EAGL.h>
-          #import <OpenGLES/ES2/gl.h>
-          #import <OpenGLES/ES2/glext.h>
+          #import <OpenGLES/ES3/gl.h>      /* ES 3.0 only */
+          #import <OpenGLES/ES3/glext.h>
           #import <AudioToolbox/AudioToolbox.h>
           #import <AVFoundation/AVFoundation.h>
           #import <GameController/GameController.h>
@@ -260,7 +260,7 @@ jobs:
           static volatile uint32_t g_touch_mask, g_gc_mask;
           static void pad_recompute(void) { nfs_pad_state = g_touch_mask | g_gc_mask; }
 
-          /* ---------------------------------------------------------------- GL (OpenGL ES 2.0) */
+          /* ---------------------------------------------------------------- GL (OpenGL ES 3.0 only) */
           @interface GLView : UIView
           @end
           @implementation GLView
@@ -269,27 +269,33 @@ jobs:
 
           static GLView *g_glview;
           static EAGLContext *g_ctx;
-          static GLuint g_fbo, g_rbo, g_prog, g_tex, g_vbo;
+          static GLuint g_fbo, g_rbo, g_prog, g_tex, g_vbo, g_vao, g_pbo[2];
           static GLint g_vw, g_vh, g_u_isz, g_u_k;
+          static int g_pbo_i;
           static volatile int g_relayout = 1;      /* set on the main thread when the view's size changes; read by the render thread */
 
-          /* The field is 320 x (240 or so) RGB888. It lives in the corner of a 512 x 256 power-of-two texture
-           * (the PowerVR SGX of the iOS 7 devices likes those best); the vertex shader maps the quad onto that
-           * corner, the fragment shader shows it either plain bilinear or "sharp bilinear": texels stay crisp
-           * in the middle and blend only over about one screen pixel at their edges, so a 320-wide picture
-           * scaled 3x stays sharp without the blocky look of GL_NEAREST. */
+          /* The field is 320 x (240 or so) RGB888. It lives in the corner of a 512 x 256 texture; the vertex shader maps
+           * the quad onto that corner, the fragment shader shows it either plain bilinear or "sharp bilinear": texels
+           * stay crisp in the middle and blend only over about one screen pixel at their edges, so a 320-wide picture
+           * scaled 3x stays sharp without the blocky look of GL_NEAREST.
+           * ES 3.0: GLSL ES 3.00, an immutable RGB8 texture (glTexStorage2D), a VAO for the quad, and the field
+           * goes up through two pixel-unpack buffers in turn, so glTexSubImage2D does not stall on the GPU's last read. */
           #define TEX_W 512
           #define TEX_H 256
 
-          static const char *VS =
-              "attribute vec2 p; attribute vec2 t; varying highp vec2 uv;"
+          /* GLSL ES 3.00 */
+          static const char *VS3 =
+              "#version 300 es\n"
+              "layout(location=0) in vec2 p; layout(location=1) in vec2 t; out highp vec2 uv;"
               "void main(){ uv = t; gl_Position = vec4(p, 0.0, 1.0); }";
-          static const char *FS_PLAIN =
-              "precision mediump float; varying highp vec2 uv; uniform sampler2D s;"
+          static const char *FS3_PLAIN =
+              "#version 300 es\n"
+              "precision mediump float; in highp vec2 uv; uniform sampler2D s; out vec4 o;"
               "uniform highp vec2 isz; uniform highp float k;"
-              "void main(){ gl_FragColor = vec4(texture2D(s, uv * isz / vec2(512.0, 256.0)).rgb, 1.0); }";
-          static const char *FS_SHARP =
-              "precision highp float; varying highp vec2 uv; uniform sampler2D s;"
+              "void main(){ o = vec4(texture(s, uv * isz / vec2(512.0, 256.0)).rgb, 1.0); }";
+          static const char *FS3_SHARP =
+              "#version 300 es\n"
+              "precision highp float; in highp vec2 uv; uniform sampler2D s; out vec4 o;"
               "uniform vec2 isz; uniform float k;"
               "void main(){"
               "  vec2 texel = uv * isz;"
@@ -297,9 +303,8 @@ jobs:
               "  vec2 d = fract(texel) - 0.5;"
               "  vec2 f = (d - clamp(d, -range, range)) * k + 0.5;"
               "  vec2 m = clamp(floor(texel) + f, vec2(0.5), isz - 0.5);"
-              "  gl_FragColor = vec4(texture2D(s, m / vec2(512.0, 256.0)).rgb, 1.0);"
+              "  o = vec4(texture(s, m / vec2(512.0, 256.0)).rgb, 1.0);"
               "}";
-
           static GLuint compile(GLenum type, const char *src)
           {
               GLuint s = glCreateShader(type);
@@ -309,10 +314,10 @@ jobs:
               return s;
           }
 
-          static GLuint link_program(const char *fs)
+          static GLuint link_program(const char *vs, const char *fs)
           {
-              GLuint v = compile(GL_VERTEX_SHADER, VS), f = compile(GL_FRAGMENT_SHADER, fs);
-              if (!v || !f) return 0;
+              GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+              if (!v || !f) { if (v) glDeleteShader(v); if (f) glDeleteShader(f); return 0; }
               GLuint pr = glCreateProgram();
               glAttachShader(pr, v); glAttachShader(pr, f);
               glBindAttribLocation(pr, 0, "p"); glBindAttribLocation(pr, 1, "t");
@@ -337,12 +342,14 @@ jobs:
               if (ar > 4.f / 3.f) sx = (4.f / 3.f) / ar; else sy = ar / (4.f / 3.f);
               /* x y u v; v runs 0 at the top of the picture */
               const float q[16] = { -sx,-sy, 0,1,   sx,-sy, 1,1,   -sx,sy, 0,0,   sx,sy, 1,0 };
+              glBindVertexArray(g_vao);
               glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
               glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STATIC_DRAW);
               glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
               glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
               /* screen pixels per source texel across, for the sharp filter (1 = plain bilinear) */
               float k = (sx * (float)g_vw * 0.5f) / 160.f; if (k < 1.f) k = 1.f;
+              glUseProgram(g_prog);
               glUniform1f(g_u_k, k);
               glViewport(0, 0, g_vw, g_vh);
               g_relayout = 0;
@@ -357,19 +364,21 @@ jobs:
                   layer.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking: @NO,
                                                 kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGB565 };
               });
-              g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
-              [EAGLContext setCurrentContext:g_ctx];
+              /* OpenGL ES 3.0 only (iPhone 5s / iPad Air / mini 2 and later, iOS 7+) */
+              g_ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+              if (!g_ctx || ![EAGLContext setCurrentContext:g_ctx]) nfs_host_fatal("OpenGL ES 3.0 is not available on this device");
               nfs_host_log("[GL] %s / %s", (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
 
-              g_prog = link_program(FS_SHARP);
-              if (!g_prog) { nfs_host_log("[GL] sharp filter unavailable, plain bilinear"); g_prog = link_program(FS_PLAIN); }
-              if (!g_prog) nfs_host_fatal("GLES2 shaders failed (see nfs.log)");
+              g_prog = link_program(VS3, FS3_SHARP);
+              if (!g_prog) { nfs_host_log("[GL] sharp filter unavailable, plain bilinear"); g_prog = link_program(VS3, FS3_PLAIN); }
+              if (!g_prog) nfs_host_fatal("GL shaders failed (see nfs.log)");
               glUseProgram(g_prog);
               glUniform1i(glGetUniformLocation(g_prog, "s"), 0);
               g_u_isz = glGetUniformLocation(g_prog, "isz");
               g_u_k = glGetUniformLocation(g_prog, "k");
 
               glGenFramebuffers(1, &g_fbo); glGenRenderbuffers(1, &g_rbo); glGenBuffers(1, &g_vbo);
+              glGenVertexArrays(1, &g_vao);
               gl_layout();
 
               glActiveTexture(GL_TEXTURE0);
@@ -379,8 +388,15 @@ jobs:
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
               glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
               glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-              /* storage once, empty; every field after is a glTexSubImage2D of the rows it has */
-              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, TEX_W, TEX_H, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+              /* immutable storage, one level; every field after is a glTexSubImage2D of the rows it has,
+               * read from a pixel-unpack buffer (two of them, alternating) */
+              glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, TEX_W, TEX_H);
+              glGenBuffers(2, g_pbo);
+              for (int i = 0; i < 2; i++) {
+                  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_pbo[i]);
+                  glBufferData(GL_PIXEL_UNPACK_BUFFER, TEX_W * TEX_H * 3, NULL, GL_STREAM_DRAW);
+              }
+              glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
               glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_DITHER); glDisable(GL_CULL_FACE);
               glClearColor(0, 0, 0, 1);
           }
@@ -403,7 +419,15 @@ jobs:
               glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
               glClear(GL_COLOR_BUFFER_BIT);                     /* the letterbox bars; a clear costs nothing on a tiled GPU */
               glBindTexture(GL_TEXTURE_2D, g_tex);
-              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+              size_t n = (size_t)w * (size_t)h * 3;
+              g_pbo_i ^= 1;
+              glBindBuffer(GL_PIXEL_UNPACK_BUFFER, g_pbo[g_pbo_i]);
+              glBufferData(GL_PIXEL_UNPACK_BUFFER, TEX_W * TEX_H * 3, NULL, GL_STREAM_DRAW);   /* orphan: no wait for the last read */
+              glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)n, px);
+              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, (const void *)0);
+              glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+              glBindVertexArray(g_vao);
+              glUseProgram(g_prog);
               glUniform2f(g_u_isz, (GLfloat)w, (GLfloat)h);
               glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
               { static int errs; GLenum e = glGetError(); if (e && errs < 20) { errs++; nfs_host_log("[GL] error 0x%x after draw", e); } }
@@ -733,7 +757,7 @@ jobs:
           	<key>CFBundleShortVersionString</key><string>0.1.0</string>
           	<key>CFBundleVersion</key><string>1</string>
           	<key>MinimumOSVersion</key><string>7.0</string>
-          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-3</string></array>
           	<key>LSRequiresIPhoneOS</key><true/>
           	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
           	<key>UISupportedInterfaceOrientations</key>
