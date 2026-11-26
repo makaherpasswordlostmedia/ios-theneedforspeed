@@ -1,4 +1,4 @@
-name: NFS 3DO -> iOS 7 armv7 (single-file build)
+name: NFS 3DO -> iOS 7 arm64 (single-file build)
 
 # ONE file. Put it at .github/workflows/nfs-ios7.yml in YOUR FORK of pc-theneedforspeed (default branch), then Actions -> this workflow -> Run workflow. Nothing else to upload:
 # the host code, Makefile and plist are written by the "Write project" step below.
@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   build:
-    name: NFS 3DO armv7 (Theos, iOS 7.0-9.3.5)
+    name: NFS 3DO arm64 (Theos, iOS 7.0-9.3.5)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -85,7 +85,7 @@ jobs:
           mkdir -p "$(dirname "$P/host/nfs_host.h")"
           cat > "$P/host/nfs_host.h" <<'NFS_EOF'
           /* nfs_host.h - the seam between the pfboot core (3dokit-recompiled NFS + Portfolio runtime)
-           * and the iOS 7 / armv7 host. The core's SDL3 window/audio/pad layer is replaced by this.
+           * and the iOS 7 / arm64 host. The core's SDL3 window/audio/pad layer is replaced by this.
            * Plain C so it links from both the C++ core and the Objective-C host. */
           #ifndef NFS_HOST_H
           #define NFS_HOST_H
@@ -134,7 +134,7 @@ jobs:
           mkdir -p "$(dirname "$P/host/ios_host.m")"
           cat > "$P/host/ios_host.m" <<'NFS_EOF'
           /* ios_host.m - UIKit / EAGL (GLES 3) / AudioQueue host for the NFS (3DO) core.
-           * iOS 7.0-9.3.5, armv7, ARC on. Structure from CrashBandicoot.Native/host/ios_host.m:
+           * iOS 7.0-9.3.5, arm64, ARC on. Structure from CrashBandicoot.Native/host/ios_host.m:
            * the emulation thread owns GL, touch overlay, MFi pad, pause on resign-active. */
           #import <UIKit/UIKit.h>
           #import <QuartzCore/QuartzCore.h>
@@ -697,11 +697,11 @@ jobs:
           NFS_EOF
           mkdir -p "$(dirname "$P/Makefile")"
           cat > "$P/Makefile" <<'NFS_EOF'
-          # The Need for Speed (3DO) -> iOS 7.0-9.3.5, armv7 (32-bit). Theos project, same toolchain as
+          # The Need for Speed (3DO) -> iOS 7.0-9.3.5, arm64 (A7 and later; GLES 3 needs them anyway). Theos project, same toolchain as
           # CrashBandicoot.Native. Core = 3dokit-recompiled C++ + the Portfolio runtime (pfboot) WITHOUT its
           # SDL3 front end; host/ios_host.m replaces that front end (see docs/PORTING.md).
           export THEOS_DEVICE_IP =
-          ARCHS = armv7
+          ARCHS = arm64
           TARGET = iphone:clang:9.3:7.0
           INSTALL_TARGET_PROCESSES = NeedForSpeed3DO
 
@@ -721,7 +721,7 @@ jobs:
           ADDITIONAL_CFLAGS += -fno-modules -fno-implicit-modules -fno-implicit-module-maps \
           	-Wno-deprecated-declarations -Wno-unused-label -Wno-unused-variable -Wno-unused-function \
           	-Wno-unused-parameter -Wno-error -Wno-missing-braces -Wno-unknown-warning-option -fno-strict-aliasing \
-          	-fno-stack-protector -fomit-frame-pointer -ffunction-sections -fdata-sections -mfpu=neon
+          	-fno-stack-protector -fomit-frame-pointer -ffunction-sections -fdata-sections
           NeedForSpeed3DO_CCFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
           NeedForSpeed3DO_CXXFLAGS = -std=c++20 -stdlib=libc++ -DNFS_IOS7=1
           NeedForSpeed3DO_CFLAGS = -I$(CURDIR)/host -I$(CURDIR)/core -I$(CURDIR)/build/recomp -DNDEBUG
@@ -749,7 +749,7 @@ jobs:
           <dict>
           	<key>CFBundleDevelopmentRegion</key><string>en</string>
           	<key>CFBundleExecutable</key><string>NeedForSpeed3DO</string>
-          	<key>CFBundleIdentifier</key><string>com.example.nfs3do.armv7</string>
+          	<key>CFBundleIdentifier</key><string>com.example.nfs3do.arm64</string>
           	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
           	<key>CFBundleName</key><string>NFS 3DO</string>
           	<key>CFBundleDisplayName</key><string>NFS 3DO</string>
@@ -757,7 +757,7 @@ jobs:
           	<key>CFBundleShortVersionString</key><string>0.1.0</string>
           	<key>CFBundleVersion</key><string>1</string>
           	<key>MinimumOSVersion</key><string>7.0</string>
-          	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-3</string></array>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>opengles-3</string></array>
           	<key>LSRequiresIPhoneOS</key><true/>
           	<key>UIDeviceFamily</key><array><integer>2</integer><integer>1</integer></array>
           	<key>UISupportedInterfaceOrientations</key>
@@ -1128,11 +1128,11 @@ jobs:
           }  // namespace fsshim
           NFS_EOF
           cat > "$P/control" <<'CTL'
-          Package: com.example.nfs3do.armv7
+          Package: com.example.nfs3do.arm64
           Name: NFS 3DO
           Version: 0.1.0
           Architecture: iphoneos-arm
-          Description: The Need for Speed (3DO), static recompilation, iOS 7 armv7
+          Description: The Need for Speed (3DO), static recompilation, iOS 7 arm64
           Maintainer: local
           Author: local
           Section: Games
@@ -1472,6 +1472,439 @@ jobs:
           else
             echo "::warning::speed patch does not apply to this 3dokit revision; building without it"
           fi
+          # second round, on top of the first (bit-exact too, the cel part checked against the first round's code on
+          # random CCB lists): a cel with no frame-buffer source computes its pixel once and stores the run; the DSP
+          # frame no longer copies the running list and walks a map for every one of its 44,100 frames a second
+          cat > "$WORK/nfs-perf2.patch" <<'PERF2_EOF'
+          diff --git a/3dokit/runtime/pf_cel.cpp b/3dokit/runtime/pf_cel.cpp
+          index 6c00946..a55058b 100644
+          --- a/3dokit/runtime/pf_cel.cpp
+          +++ b/3dokit/runtime/pf_cel.cpp
+          @@ -351,13 +351,35 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                   const uint32_t mode = pm ? g_ce.pixc >> 16 : g_ce.pixc & 0xFFFF;
+                   const bool needfb = (mode & 0x8000u) || (mode >> 6 & 3) == 2;       // the frame buffer pixel is a source of the pixel processor
+                   const uint32_t vhp = vh_pre(dec);
+          -        auto plot = [&](int32_t x, int32_t y) {                              // inside the clip
+          -            uint32_t fb = needfb ? blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3) : 0;
+          +        // The word a pixel is written with, from the pixel processor's output for it.
+          +        auto word_of = [&](uint32_t fb) {
+                       uint32_t pp = ppmp(c, mode, pix, fb, amv, cel.flags);
+                       if (!(pp & 0x7FFF) && !(cel.flags & CCB_NOBLK)) pp = 1 << 10;   // black is written as red 1
+                       uint32_t vh = vhp;
+                       switch (b0pos) { case 0: vh &= ~1u; break; case 1: vh |= 1; break; case 2: vh = (vh & ~1u) | (pp & 1); break; }
+          -            fb_write(t.write, t.width, x, y, (pp & 0x7FFEu) | vh);
+          +            return (pp & 0x7FFEu) | vh;
+          +        };
+          +        // With no frame buffer source the word is the same for every pixel of this source pixel: made once, at the
+          +        // first pixel painted (so a stop of the pixel processor comes where it came), then only stored.
+          +        bool have_val = false;
+          +        uint32_t val = 0;
+          +        auto constval = [&]() { if (!have_val) { val = word_of(0); have_val = true; } return val; };
+          +        auto plot = [&](int32_t x, int32_t y) {                              // inside the clip
+          +            if (!needfb) { fb_write(t.write, t.width, x, y, constval()); return; }
+          +            fb_write(t.write, t.width, x, y, word_of(blue_lsb(fb_read(t.read, t.width, x, y), cec >> 22 & 3)));
+          +        };
+          +        // A run of pixels of one row, xa..xb inside the clip.
+          +        auto paint_run = [&](int32_t y, int32_t xa, int32_t xb) {
+          +            if (needfb) { for (int32_t x = xa; x <= xb; ++x) plot(x, y); return; }
+          +            const uint32_t v = constval();
+          +            uint32_t a0 = fb_addr(t.write, t.width, xa, y), a1 = fb_addr(t.write, t.width, xb, y);
+          +            if (ARM_LIKELY_IN(a0) && ARM_LIKELY_IN(a1) && a0 <= a1) {
+          +                // the line pair's word, big-endian in memory: the even line's pixel in its first two bytes, the odd's in the last two
+          +                uint8_t* q = g_arm_mem + (a0 & ~3u) + ((uint32_t)(y & 1) << 1);
+          +                const uint8_t hi = (uint8_t)(v >> 8), lo = (uint8_t)v;
+          +                for (int32_t n = xb - xa; n >= 0; --n, q += 4) { q[0] = hi; q[1] = lo; }
+          +            } else
+          +                for (int32_t x = xa; x <= xb; ++x) fb_write(t.write, t.width, x, y, v);
+                   };
+                   // An upright rectangle (no turn, no bend: the usual cel) is fill_quad's walk in closed form:
+                   // its two vertical edges, the one more to the left first, painted when the flag of the way
+          @@ -369,8 +391,8 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                       if (!(cel.flags & (down_first ? CCB_ACCW : CCB_ACW))) return;
+                       int32_t xa = std::max(std::min(x0, x1), 0), xb = std::min(std::max(x0, x1) - 1, t.xclip);
+                       int32_t ya = std::max(std::min(y0, y3), 0), yb = std::min(std::max(y0, y3) - 1, t.yclip);
+          -            for (int32_t y = ya; y <= yb; ++y)
+          -                for (int32_t x = xa; x <= xb; ++x) plot(x, y);
+          +            if (xa <= xb)
+          +                for (int32_t y = ya; y <= yb; ++y) paint_run(y, xa, xb);
+                       return;
+                   }
+                   // A trapezoid with a flat top and bottom (a strip bent by HDDX: the road, the floor): the same two
+          @@ -393,7 +415,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                           bool lo_down = a_first ? a_down : !a_down;
+                           if (lo >= hi || !(cel.flags & (lo_down ? CCB_ACCW : CCB_ACW))) continue;
+                           int32_t from = std::max(lo, 0), to = std::min(hi - 1, t.xclip);
+          -                for (int32_t px = from; px <= to; ++px) plot(px, r);
+          +                if (from <= to) paint_run(r, from, to);
+                       }
+                       return;
+                   }
+          diff --git a/3dokit/runtime/pf_dsp.cpp b/3dokit/runtime/pf_dsp.cpp
+          index 36bd4ab..4c664db 100644
+          --- a/3dokit/runtime/pf_dsp.cpp
+          +++ b/3dokit/runtime/pf_dsp.cpp
+          @@ -126,6 +126,7 @@ struct Unit {
+               std::vector<std::string> names;
+               std::vector<int16_t> mem;                           // per resource: its word in DSP memory
+               std::map<uint32_t, Input> fed;                      // a resource another instrument's variable feeds
+          +    std::vector<const Input*> fedv;                     // the same by resource, null where none: value() reads it without a tree walk
+               std::map<uint32_t, Fifo> fifo;                      // by the FIFO's resource
+               // sampler.dsp's registers in its ring (MYRB): R5 the phase, R6 and R7 the two samples
+               int16_t r5 = 0, r6 = 0, r7 = 0;
+          @@ -152,6 +153,11 @@ struct Unit {
+ 
+           std::map<int32_t, Unit> g_units;
+           std::vector<int32_t> g_order;                           // the running ones, as the DSP runs them
+          +// What a frame walks: g_order with each instrument's Unit found, rebuilt only when the units or the order
+          +// change (g_epoch moves on every such change) instead of copied and searched 44,100 times a second.
+          +struct Slot { int32_t item; Unit* u; };
+          +std::vector<Slot> g_slots;
+          +uint64_t g_epoch = 1, g_slots_epoch = 0;
+           int16_t g_bus_l, g_bus_r;                               // I memory 0x106, 0x107: what the mixers add up
+           uint64_t g_frames;                                      // frames made since the boot
+           bool g_in_frame;
+          @@ -175,10 +181,11 @@ int rsrc_named(const Unit& u, const std::string& name) {
+ 
+           int16_t value(const Unit& u, int r) {
+               if (r < 0) return 0;
+          -    auto f = u.fed.find((uint32_t)r);
+          -    if (f != u.fed.end()) {
+          -        auto s = g_units.find(f->second.src);
+          -        if (s != g_units.end() && f->second.rsrc < s->second.mem.size()) return s->second.mem[f->second.rsrc];
+          +    if ((size_t)r < u.fedv.size()) {
+          +        if (const Input* f = u.fedv[(size_t)r]) {
+          +            auto s = g_units.find(f->src);
+          +            if (s != g_units.end() && f->rsrc < s->second.mem.size()) return s->second.mem[f->rsrc];
+          +        }
+               }
+               return u.mem[(size_t)r];
+           }
+          @@ -984,11 +991,26 @@ void frame() {
+               k.rbase = 0;
+               k.rmap = 0;
+               k.opmask = 0x1f;
+          -    std::vector<int32_t> order = g_order;
+          -    for (int32_t item : order) {
+          -        auto it = g_units.find(item);
+          -        if (it == g_units.end()) continue;
+          -        Unit& u = it->second;
+          +    if (g_slots_epoch != g_epoch) {
+          +        g_slots.clear();
+          +        for (int32_t item : g_order) {
+          +            auto it = g_units.find(item);
+          +            g_slots.push_back({item, it == g_units.end() ? nullptr : &it->second});
+          +        }
+          +        g_slots_epoch = g_epoch;
+          +    }
+          +    // An instrument's end can change the program in the middle of a frame (the folio's handler stops it, frees it):
+          +    // the frame goes on over the order it began with, each unit looked up afresh from then on, as it always did.
+          +    const uint64_t epoch0 = g_epoch;
+          +    for (size_t si = 0; si < g_slots.size(); ++si) {
+          +        const int32_t item = g_slots[si].item;
+          +        Unit* up = g_slots[si].u;
+          +        if (g_epoch != epoch0) {
+          +            auto it = g_units.find(item);
+          +            up = it == g_units.end() ? nullptr : &it->second;
+          +        }
+          +        if (!up) continue;
+          +        Unit& u = *up;
+                   if (u.interp) {
+                       if (!run_code(item, u)) {
+                           std::fprintf(stderr, "pfboot: the DSP instrument %s ran %d instructions without SLEEP: silent from now\n",
+          @@ -1035,6 +1057,7 @@ bool pf_dsp_wav(const char* path) {
+           // The folio's start: no instrument, nothing on the bus. The frames made go on counting (pfboot
+           // --boot starts a fresh OS for each program; the guest's clock goes on).
+           void pf_dsp_init() {
+          +    ++g_epoch;
+               g_units.clear();
+               g_order.clear();
+               g_bus_l = g_bus_r = 0;
+          @@ -1111,6 +1134,7 @@ void pf_dsp_new(int32_t ins, const PfDspTemplate& t, uint8_t pri) {
+                   u.left.push_back(rsrc_named(u, "LeftGain" + std::to_string(i)));
+                   u.right.push_back(rsrc_named(u, "RightGain" + std::to_string(i)));
+               }
+          +    ++g_epoch;
+               g_units[ins] = std::move(u);
+           }
+ 
+          @@ -1122,17 +1146,26 @@ void pf_dsp_write(int32_t ins, uint32_t rsrc, int32_t v) {
+ 
+           void pf_dsp_connect(int32_t src, uint32_t src_rsrc, int32_t dst, uint32_t dst_rsrc) {
+               auto it = g_units.find(dst);
+          -    if (it != g_units.end()) it->second.fed[dst_rsrc] = {src, src_rsrc};
+          +    if (it != g_units.end()) {
+          +        Unit& u = it->second;
+          +        u.fed[dst_rsrc] = {src, src_rsrc};
+          +        if (u.fedv.size() <= dst_rsrc) u.fedv.resize((size_t)dst_rsrc + 1, nullptr);
+          +        u.fedv[dst_rsrc] = &u.fed[dst_rsrc];
+          +    }
+           }
+ 
+           void pf_dsp_disconnect(int32_t dst, uint32_t dst_rsrc) {
+               auto it = g_units.find(dst);
+          -    if (it != g_units.end()) it->second.fed.erase(dst_rsrc);
+          +    if (it != g_units.end()) {
+          +        it->second.fed.erase(dst_rsrc);
+          +        if (dst_rsrc < it->second.fedv.size()) it->second.fedv[dst_rsrc] = nullptr;
+          +    }
+           }
+ 
+           // Into the DSP's program or out of it: the folio's list of running instruments (0xc2d8) is by
+           // priority, a new one after those of its own (the kernel's UniversalInsertNode, 0xb950).
+           void pf_dsp_run(int32_t ins, bool on) {
+          +    ++g_epoch;
+               for (size_t i = 0; i < g_order.size(); ++i)
+                   if (g_order[i] == ins) {
+                       g_order.erase(g_order.begin() + (long)i);
+          PERF2_EOF
+          if patch -p1 --dry-run < "$WORK/nfs-perf2.patch" >/dev/null; then
+            patch -p1 < "$WORK/nfs-perf2.patch"
+          else
+            echo "::warning::second speed patch does not apply (the first one did not, or the revision moved); skipped"
+          fi
+          # third round: the cel engine on two threads, a band of the picture each (the lower half by a worker), a list
+          # big enough only, bit-exact against the single-threaded engine on random CCB lists
+          cat > "$WORK/nfs-perf3.patch" <<'PERF3_EOF'
+          diff --git a/3dokit/runtime/pf_cel.cpp b/3dokit/runtime/pf_cel.cpp
+          index a55058b..5a211fa 100644
+          --- a/3dokit/runtime/pf_cel.cpp
+          +++ b/3dokit/runtime/pf_cel.cpp
+          @@ -14,6 +14,9 @@
+           #include <algorithm>
+           #include <atomic>
+           #include <chrono>
+          +#include <condition_variable>
+          +#include <mutex>
+          +#include <thread>
+           #include <cstdio>
+           #include <utility>
+ 
+          @@ -40,7 +43,7 @@ struct Engine {
+               uint32_t pixc;
+               uint16_t plut[32];
+           };
+          -Engine g_ce;
+          +Engine g_ce_main;                       // the engine the guest sees; a second one serves the worker thread's band (see pf_cel_draw)
+ 
+           // Where a CCB's pointer leads: absolute, or relative to the word that holds it -- the target less
+           // the word's address less 4 (graphics.h's MakeCCBRelative). 24 bits (Opera).
+          @@ -88,6 +91,8 @@ struct Bits {
+           struct Target {
+               uint32_t cecontrol, write, read, width;     // the buffers and their width in pixels
+               int32_t xclip, yclip;                       // the last pixel drawn into, each way
+          +    Engine* e = nullptr;                        // the engine registers this draw runs on
+          +    int32_t ylo = 0;                            // the first row drawn into (a band of the picture), yclip the last
+           };
+ 
+           // A frame buffer pixel: the 3DO's line pairs, row y's pixel in the high half of the word at
+          @@ -132,7 +137,7 @@ struct Cel {
+           // PLUTA; 6 bits the low five, bit 5 becoming bit 15; 8 bits the low five, the top three an AMV for
+           // all three; 16 bits the low five, bits 5-13 the AMVs, bit 15 kept. Uncoded 16 bits are the colour,
+           // uncoded 8 bits RRRGGGBB widened.
+          -uint32_t decode(ArmCpu& c, const Cel& cel, uint32_t v, uint32_t& amv) {
+          +uint32_t decode(ArmCpu& c, const Cel& cel, const Engine& g_ce, uint32_t v, uint32_t& amv) {
+               amv = 0x49;
+               uint32_t pluta = cel.flags & 15;
+               switch (cel.bpp) {
+          @@ -282,6 +287,7 @@ int quad_turn(const int32_t qx[4], const int32_t qy[4]) {
+           // by those plus HDDX and HDDY. HDX and the rest are 12.20 and step a 16.16 position with their
+           // four lowest bits cut away; HDDX adds to HDX at its full 20 bits (the patent's sum unit, 6.5).
+           void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+          +    Engine& g_ce = *t.e;
+               // PRE0's BGND bit: the guide calls bits 28-31 reserved; Opera never reads it; the SDK's own
+               // libraries (Lib3DO's CreateBackdropCel, TextLib) set and clear it together with the CCB's BGND,
+               // "don't skip 0-valued pixels, really, trust me". With the CCB's BGND also set both readings draw
+          @@ -341,7 +347,12 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                   bx += (int32_t)n * (hx2 >> 4); by += (int32_t)n * (hy2 >> 4);
+               };
+               auto pixel = [&](uint32_t v) {
+          -        uint32_t amv, dec = decode(c, cel, v, amv);
+          +        {   // a source pixel whose rows all fall outside the rows drawn into (a band, or off the picture) paints nothing
+          +            int32_t ya = std::min(std::min(ty, ty + (hy >> 4)), std::min(by + (hy2 >> 4), by)) >> 16;
+          +            int32_t yb = std::max(std::max(ty, ty + (hy >> 4)), std::max(by + (hy2 >> 4), by)) >> 16;
+          +            if (yb <= t.ylo || ya > t.yclip) { skip(1); return; }
+          +        }
+          +        uint32_t amv, dec = decode(c, cel, g_ce, v, amv);
+                   int32_t qx[4] = {tx, tx + (hx >> 4), bx + (hx2 >> 4), bx};
+                   int32_t qy[4] = {ty, ty + (hy >> 4), by + (hy2 >> 4), by};
+                   skip(1);
+          @@ -390,7 +401,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                       bool down_first = x1 < x0 ? y3 > y0 : y0 > y3;                  // the left edge's way
+                       if (!(cel.flags & (down_first ? CCB_ACCW : CCB_ACW))) return;
+                       int32_t xa = std::max(std::min(x0, x1), 0), xb = std::min(std::max(x0, x1) - 1, t.xclip);
+          -            int32_t ya = std::max(std::min(y0, y3), 0), yb = std::min(std::max(y0, y3) - 1, t.yclip);
+          +            int32_t ya = std::max(std::min(y0, y3), t.ylo), yb = std::min(std::max(y0, y3) - 1, t.yclip);
+                       if (xa <= xb)
+                           for (int32_t y = ya; y <= yb; ++y) paint_run(y, xa, xb);
+                       return;
+          @@ -406,7 +417,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                       const int32_t ahi_y = a_down ? y0 : y3, alo_y = a_down ? y3 : y0, ahi_x = a_down ? x1 : x2, alo_x = a_down ? x2 : x1;
+                       const int32_t bhi_y = a_down ? y0 : y3, blo_y = a_down ? y3 : y0, bhi_x = a_down ? x0 : x3, blo_x = a_down ? x3 : x0;
+                       const int32_t span = alo_y - ahi_y;
+          -            for (int32_t r = std::max(top, 0); r < bot && r <= t.yclip; ++r) {
+          +            for (int32_t r = std::max(top, t.ylo); r < bot && r <= t.yclip; ++r) {
+                           int32_t xa = ahi_x + (int32_t)((int64_t)(alo_x - ahi_x) * (r - ahi_y) / span);
+                           int32_t xb = bhi_x + (int32_t)((int64_t)(blo_x - bhi_x) * (r - bhi_y) / (blo_y - bhi_y));
+                           // sorted by x, an edge going up first at a tie: A goes down when a_down, B goes up then
+          @@ -420,7 +431,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+                       return;
+                   }
+                   fill_quad(qx, qy, cel.flags, [&](int32_t x, int32_t y) {
+          -            if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
+          +            if (x < 0 || x > t.xclip || y < t.ylo || y > t.yclip) return;
+                       plot(x, y);
+                   });
+               };
+          @@ -495,13 +506,16 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
+           // one by; the flags say which words follow XPOS and YPOS (HDX to VDY, HDDX and HDDY, PIXC, then
+           // the preamble when CCBPRE), what is loaded, and whether the preamble opens the source data
+           // instead. LDPLUT loads 4 words of PLUT for 1 and 2 bits a pixel, 8 for 4, 16 for more.
+          -static void cel_draw_all(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+          +static void cel_draw_all(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb, Engine& g_ce, int32_t ylo, int32_t yhi) {
+               static const uint32_t lo[16] = {0, 32, 512, 0, 256, 0, 0, 0, 1024}, hi[16] = {0, 64, 128, 0, 0, 0, 0, 0, 1024};
+               uint32_t r0 = regctl[0];
+               if ((r0 & 0xFF) != (r0 >> 8 & 0xFF) || (r0 >> 16)) pf_stop(c, "the cel engine: a read width other than the write width: not yet");
+               Target t{cecontrol, regctl[3], regctl[2], lo[r0 & 15] + hi[r0 >> 4 & 15],
+                        (int32_t)(regctl[1] & 0x7FF), (int32_t)(regctl[1] >> 16 & 0x7FF)};
+               if (!t.width) pf_stop(c, "the cel engine: a REGCTL0 not in GRAPHIX's table: not yet");
+          +    t.e = &g_ce;
+          +    t.ylo = ylo;
+          +    if (yhi >= 0 && yhi < t.yclip) t.yclip = yhi;
+               for (int guard = 0; ccb; ++guard) {
+                   if (guard > 100000) pf_stop(c, "the cel engine: a CCB list that does not end");
+                   uint32_t f = pf_r32(ccb);
+          @@ -549,11 +563,124 @@ static void cel_draw_all(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4]
+               }
+           }
+ 
+          +// ---- two threads, a band of the picture each -----------------------------------------------------------------
+          +// Every pixel of the frame buffer is written from its own source pixel and (with a frame buffer source) its
+          +// own old value, so the picture can be cut in rows and the halves painted at once, each by the whole CCB list
+          +// walked afresh with its own copy of the engine's registers: what a CCB loads and the cels leave behind does
+          +// not depend on where the clip is, so both copies end the same. The cut is at an even row, since a line pair
+          +// shares a word. Not done when a cel's source data lies in or just under the buffer drawn into (a cel read
+          +// from what an earlier cel of the list painted), nor for a list too small to pay for waking the other thread.
+          +namespace {
+          +
+          +struct Scan { double work = 0; bool overlap = false; };
+          +
+          +// The CCB list read through, nothing drawn: a rough count of the pixels it paints, and whether a source overlaps the target.
+          +Scan scan_list(const Engine& e0, uint32_t ccb, const Target& t) {
+          +    Scan sc;
+          +    double hx = e0.hdx / 1048576.0, vy = e0.vdy / 65536.0;
+          +    const uint32_t dlo = t.write, dhi = t.write + (uint32_t)((t.yclip >> 1) + 1) * t.width * 4;
+          +    for (int guard = 0; ccb && guard < 100000; ++guard) {
+          +        uint32_t f = pf_r32(ccb);
+          +        if (!(f & CCB_SKIP)) {
+          +            uint32_t p = ccb + 24;
+          +            if (f & CCB_LDSIZE) { hx = (int32_t)pf_r32(p) / 1048576.0; vy = (int32_t)pf_r32(p + 12) / 65536.0; p += 16; }
+          +            if (f & CCB_LDPRS) p += 8;
+          +            if (f & CCB_LDPPMP) p += 4;
+          +            uint32_t src = pointer(ccb + 8, f & CCB_SPABS);
+          +            uint32_t pre = f & CCB_CCBPRE ? p : src;
+          +            uint32_t pre0 = pf_r32(pre), pre1 = f & CCB_PACKED ? 0 : pf_r32(pre + 4);
+          +            double rows = (double)((pre0 >> 6 & 0x3FF) + 1), w = f & CCB_PACKED ? 32.0 : (double)((pre1 & 0x7FF) + 1);
+          +            double sx = hx < 0 ? -hx : hx, sy = vy < 0 ? -vy : vy;
+          +            sc.work += rows * w * (sx > 1 ? sx : 1) * (sy > 1 ? sy : 1);
+          +            if (src + 0x10000u >= dlo && src < dhi) sc.overlap = true;
+          +        }
+          +        if (f & CCB_LAST) break;
+          +        ccb = pointer(ccb + 4, f & CCB_NPABS);
+          +    }
+          +    return sc;
+          +}
+          +
+          +struct Pool {
+          +    std::mutex m;
+          +    std::condition_variable cv;
+          +    std::atomic<int> state{0};                  // 0 idle, 1 a job is posted, 2 it is done
+          +    ArmCpu* c = nullptr;
+          +    uint32_t cec = 0, regctl[4] = {}, ccb = 0;
+          +    Engine eng;
+          +    int32_t ylo = 0, yhi = 0;
+          +    uint64_t ns = 0;
+          +};
+          +Pool* g_pool;
+          +
+          +void worker_main(Pool* P) {
+          +    for (;;) {
+          +        auto idle_from = std::chrono::steady_clock::now();
+          +        while (P->state.load(std::memory_order_acquire) != 1) {
+          +            // draws come in a burst each field: stay awake a moment after one, then sleep
+          +            if (std::chrono::steady_clock::now() - idle_from < std::chrono::microseconds(300)) continue;
+          +            std::unique_lock<std::mutex> l(P->m);
+          +            P->cv.wait_for(l, std::chrono::milliseconds(20), [&] { return P->state.load(std::memory_order_acquire) == 1; });
+          +        }
+          +        auto t0 = std::chrono::steady_clock::now();
+          +        cel_draw_all(*P->c, P->cec, P->regctl, P->ccb, P->eng, P->ylo, P->yhi);
+          +        P->ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+          +        P->state.store(2, std::memory_order_release);
+          +    }
+          +}
+          +
+          +bool parallel_ok() {
+          +    static const bool ok = std::thread::hardware_concurrency() > 1;
+          +    return ok;
+          +}
+          +
+          +}  // namespace
+          +
+          +static void cel_draw_split(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+          +    const int32_t yclip = (int32_t)(regctl[1] >> 16 & 0x7FF);
+          +    if (parallel_ok() && yclip >= 95) {
+          +        Target t{cecontrol, regctl[3], regctl[2], 32, 0, yclip};
+          +        static const uint32_t lo[16] = {0, 32, 512, 0, 256, 0, 0, 0, 1024}, hi[16] = {0, 64, 128, 0, 0, 0, 0, 0, 1024};
+          +        t.width = lo[regctl[0] & 15] + hi[regctl[0] >> 4 & 15];
+          +        if (t.width && regctl[2] == regctl[3]) {            // reads and writes the one buffer: the pixel's own word only
+          +            Scan sc = scan_list(g_ce_main, ccb, t);
+          +            if (!sc.overlap && sc.work >= 3000) {
+          +                if (!g_pool) { g_pool = new Pool; std::thread(worker_main, g_pool).detach(); }
+          +                Pool* P = g_pool;
+          +                static int32_t split = 0, split_for = -1;          // the first row of the lower band
+          +                const int32_t H = yclip + 1;
+          +                if (split_for != yclip) { split_for = yclip; split = (H / 2) & ~1; }
+          +                P->c = &c; P->cec = cecontrol;
+          +                for (int i = 0; i < 4; ++i) P->regctl[i] = regctl[i];
+          +                P->ccb = ccb; P->eng = g_ce_main; P->ylo = split; P->yhi = -1;
+          +                {
+          +                    std::lock_guard<std::mutex> l(P->m);
+          +                    P->state.store(1, std::memory_order_release);
+          +                }
+          +                P->cv.notify_one();
+          +                auto t0 = std::chrono::steady_clock::now();
+          +                cel_draw_all(c, cecontrol, regctl, ccb, g_ce_main, 0, split - 1);
+          +                uint64_t ta = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+          +                while (P->state.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+          +                P->state.store(0, std::memory_order_relaxed);
+          +                // the bands' times pull the cut towards the even share
+          +                uint64_t tb = P->ns;
+          +                if (ta + tb > 200000) {
+          +                    int32_t d = (int32_t)((double)((int64_t)tb - (int64_t)ta) / (double)(ta + tb) * 0.25 * H);
+          +                    if (d > 12) d = 12; else if (d < -12) d = -12;
+          +                    split = std::max(H / 4, std::min(H * 3 / 4, split + d)) & ~1;
+          +                }
+          +                return;
+          +            }
+          +        }
+          +    }
+          +    cel_draw_all(c, cecontrol, regctl, ccb, g_ce_main, 0, -1);
+          +}
+          +
+           // The host time the cel engine takes, for the host's stats (a CCB list is a hundred cels or so: one clock read each end).
+           std::atomic<uint64_t> g_pf_ns_cel{0};
+           void pf_cel_draw(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb) {
+               auto t0 = std::chrono::steady_clock::now();
+               struct Done { std::chrono::steady_clock::time_point t0; ~Done() {
+                   g_pf_ns_cel += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } } done{t0};
+          -    cel_draw_all(c, cecontrol, regctl, ccb);
+          +    cel_draw_split(c, cecontrol, regctl, ccb);
+           }
+          PERF3_EOF
+          if patch -p1 --dry-run < "$WORK/nfs-perf3.patch" >/dev/null; then
+            patch -p1 < "$WORK/nfs-perf3.patch"
+          else
+            echo "::warning::third speed patch (two-thread cel engine) does not apply; skipped"
+          fi
 
       - name: Collect core sources and check the glue
         id: glue
@@ -1606,13 +2039,13 @@ jobs:
           [ -n "$APP" ] || { echo "::error::NeedForSpeed3DO.app not found"; exit 1; }
           rm -rf ipa && mkdir -p ipa/Payload packages
           cp -a "$APP" ipa/Payload/
-          (cd ipa && zip -rq ../packages/NeedForSpeed3DO-armv7.ipa Payload)
+          (cd ipa && zip -rq ../packages/NeedForSpeed3DO-arm64.ipa Payload)
           ls -la packages
 
       - uses: actions/upload-artifact@v4
         if: steps.glue.outputs.ready == 'true'
         with:
-          name: NeedForSpeed3DO-armv7-iOS7
+          name: NeedForSpeed3DO-arm64-iOS7
           path: |
             ${{ env.P }}/packages/*.ipa
             ${{ env.P }}/packages/*.deb
